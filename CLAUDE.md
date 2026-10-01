@@ -353,6 +353,50 @@ instance.removeModifier(Identifier);
   要留住必须 `.immutable()` 拷一份
 - 伤害的服务端入口是 `public boolean hurtServer(ServerLevel, DamageSource, float)`
 
+### 5.17 Goal 里不要用「递减计数器」做冷却（会卡住）
+
+`GoalSelector.tick()` 里 `canUse()` **不保证每 tick 都被调用**（Flag 可能被别的 Goal 占着）。
+所以把计时器写成「在 `canUse()` 里 `if (cooldown > 0) cooldown--;`」是有隐患的。
+
+正确做法：存**绝对 tick**，比较 `entity.tickCount`：
+
+```java
+private int nextAllowedTick;                 // 字段
+
+if (entity.tickCount < this.nextAllowedTick) return false;   // canUse()
+this.nextAllowedTick = entity.tickCount + COOLDOWN;          // 用掉之后
+```
+
+这样即使 `canUse()` 隔了几秒才被调一次，时间该过去的也早过去了。
+
+### 5.18 测试用命令（已对着字节码核实）
+
+**`/damage` 的命令树** —— `<damageType>` 不是可有可无的装饰，
+**想用 `by` 就必须先把它填上**：
+
+```
+damage <目标> <伤害>
+  └ damageType                        ← 必须填，否则 by 会被当成它的值
+      ├ at <坐标>
+      └ by <实体> [from <原因>]
+```
+
+```bash
+# 让奶龙认出「是你打的」（触发报复）——注意中间那个伤害类型不能省
+/damage @e[type=mylovelymilkdragon,limit=1,sort=nearest] 5 minecraft:player_attack by @s
+```
+
+常用伤害类型：`player_attack` / `mob_attack` / `generic` / `magic` /
+`explosion` / `lava` / `fall`（完整列表见 jar 里的 `data/minecraft/damage_type/`）。
+
+**查奶龙的同步状态**（`Angry` / `Sleeping` 写在 `addAdditionalSaveData` 里，所以能读）：
+
+```bash
+/data get entity @e[type=mylovelymilkdragon,limit=1,sort=nearest] Angry
+/data get entity @e[type=mylovelymilkdragon,limit=1,sort=nearest] Sleeping
+# 返回 1b = 生效中，0b = 没有
+```
+
 ## 6. 资源文件路径（已验证）
 
 ```
@@ -485,8 +529,13 @@ src/main/resources/
 | 状态 | 触发 | 表现 |
 |---|---|---|
 | `isAngry` | 挨打累计 3 下，或睡觉时被打断 | 换贴图 + 换音效；移动速度 0.25 → 0.3；30 秒后自动平息 |
-| `isSleeping` | **随机发生，白天晚上都会** | 静止不动（`setNoAi(true)`）；被打或有玩家靠近则醒（醒 → 愤怒） |
+| `isSleeping` | **随机发生，白天晚上都会** | 静止不动（`setNoAi(true)`）；睡够了自己醒，被打或被玩家靠近则醒（后两种醒 → 愤怒） |
 | `isLaughing` | 随机 | 持续约 2 秒 |
+
+⚠️ **睡觉必须有「自然醒」**。因为睡觉走的是 `setNoAi(true)`，AI 被整个关掉——
+如果只有「玩家靠近才醒」这一个条件，奶龙在没人的地方睡着就**再也醒不过来**，
+不拆火把、不走路、什么都不做。本项目踩过这个坑（2026-10-01），
+所以 `SLEEP_DURATION_*` 那两个常量不能删。
 
 **三者的互斥关系**：愤怒会强制踢出睡觉和大笑；睡觉时笑不出来；睡觉/愤怒期间不推进入睡倒计时。
 愤怒期间和追击期间**都不会入睡**（否则会追到一半原地趴下），目标一丢倒计时继续走。
@@ -500,6 +549,9 @@ src/main/resources/
 | `LAUGH_DURATION_TICKS` | 2 秒 |
 | 两次大笑间隔 | 随机 20~60 秒 |
 | 两次入睡间隔 | 随机 30 秒 ~ 2 分钟 |
+| 一次睡觉时长 | 随机 10 ~ 30 秒（到点自然醒） |
+| 拆火把冷却 | 5 秒（用绝对 tick 算，见 5.17） |
+| 够不着时的放弃时限 | 10 秒，之后把那根火把拉黑 30 秒 |
 | `WAKE_PLAYER_RADIUS` | 4 格 |
 | `ANGRY_SPEED_BONUS` | +0.05（0.25 → 0.3） |
 

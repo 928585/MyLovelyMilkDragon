@@ -76,6 +76,16 @@ public class MilkDragonEntity extends PathfinderMob {
     private static final int SLEEP_INTERVAL_MIN_TICKS = 20 * 30;
     private static final int SLEEP_INTERVAL_MAX_TICKS = 20 * 120;
 
+    /**
+     * 一次睡觉持续多久：随机 10~30 秒。
+     *
+     * <p>⚠️ 这个「自然醒」<b>必须有</b>。之前漏了它，结果奶龙一旦在玩家 4 格以外睡着，
+     * 就再也没有任何条件能让它醒过来——{@code setNoAi(true)} 把整个 AI 关掉，
+     * 它会永远躺在那儿不拆火把、不走路、不做任何事。
+     */
+    private static final int SLEEP_DURATION_MIN_TICKS = 20 * 10;
+    private static final int SLEEP_DURATION_MAX_TICKS = 20 * 30;
+
     /** 玩家靠到多近会把睡着的奶龙吵醒（格）。 */
     private static final double WAKE_PLAYER_RADIUS = 4.0D;
 
@@ -98,6 +108,8 @@ public class MilkDragonEntity extends PathfinderMob {
     private int nextLaughTicks;
     /** 距离下一次尝试入睡还有多少 tick。 */
     private int nextSleepTicks;
+    /** 本次睡觉还剩多少 tick，睡够了自己会醒。 */
+    private int sleepTicksLeft;
 
     // ---- 4. 构造函数 ----
     public MilkDragonEntity(EntityType<? extends PathfinderMob> entityType, Level level) {
@@ -188,8 +200,11 @@ public class MilkDragonEntity extends PathfinderMob {
             this.setLaughing(false);
             this.getNavigation().stop();
             this.setNoAi(true);
+            this.sleepTicksLeft = this.randomBetween(
+                    SLEEP_DURATION_MIN_TICKS, SLEEP_DURATION_MAX_TICKS);
         } else {
             this.setNoAi(false);
+            this.sleepTicksLeft = 0;
         }
         this.nextSleepTicks = this.rollSleepInterval();
     }
@@ -276,14 +291,22 @@ public class MilkDragonEntity extends PathfinderMob {
         }
     }
 
-    /** 睡着时每 tick 检查四周：有玩家凑到 4 格以内就吵醒它，而且直接炸毛。 */
+    /**
+     * 睡着时每 tick 检查两件事：有没有玩家凑到 4 格以内把它吵醒（吵醒 → 直接炸毛），
+     * 以及有没有睡够（睡够 → 自然醒，不生气）。
+     *
+     * <p>第二条是保命的：没有它，奶龙在没人的地方睡着就再也醒不过来了。
+     */
     private void tickSleeping(ServerLevel level) {
         Player waker = level.getNearestPlayer(this, WAKE_PLAYER_RADIUS);
-        if (waker == null) {
+        if (waker != null) {
+            this.setSleeping(false);
+            this.becomeAngry();
             return;
         }
-        this.setSleeping(false);
-        this.becomeAngry();
+        if (--this.sleepTicksLeft <= 0) {
+            this.setSleeping(false);
+        }
     }
 
     private void tickLaughing() {

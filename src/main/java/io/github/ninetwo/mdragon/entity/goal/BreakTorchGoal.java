@@ -38,14 +38,37 @@ public class BreakTorchGoal extends Goal {
     /** 重算路径的间隔（tick）。每 tick 重寻路太浪费，而且会打断走路动画。 */
     private static final int REPATH_INTERVAL = 10;
 
+    /**
+     * 盯上一个火把后最多花多久走过去。
+     * 超时说明这根够不着（在墙里、悬崖上、隔了层墙），必须放弃——
+     * 否则这个 Goal 会一直占着 MOVE，奶龙就原地罚站再也不动了。
+     */
+    private static final int GIVE_UP_TICKS = 20 * 10;
+
+    /** 放弃一根火把后拉黑多久，免得冷却一过又立刻盯上同一根。 */
+    private static final int SKIP_TICKS = 20 * 30;
+
     private final MilkDragonEntity dragon;
     private final double speedModifier;
 
     /** 当前盯上的火把；{@code null} 表示没在拆。 */
     private BlockPos targetTorch;
 
-    /** 冷却剩余 tick，大于 0 时这个 Goal 不起用。 */
-    private int cooldown;
+    /** 当前这根火把已经盯了多少 tick，用来判断该不该放弃。 */
+    private int ticksOnTarget;
+
+    /**
+     * 冷却到期时刻，用<b>绝对 tick</b> 而不是递减计数器。
+     *
+     * <p>递减计数器看着更直观，但它只有在 {@code canUse()} 每 tick 都被调用时才正确，
+     * 而这一点并没有保证（Flag 可能被别的 Goal 占着）。用绝对时间就没这个问题——
+     * 就算 {@code canUse()} 隔了几秒才被调一次，该过去的也早过去了。
+     */
+    private int nextBreakAllowedTick;
+
+    /** 放弃过的火把（够不着的），以及它的解禁时刻。 */
+    private BlockPos skippedTorch;
+    private int skipUntilTick;
 
     public BreakTorchGoal(MilkDragonEntity dragon, double speedModifier) {
         this.dragon = dragon;
@@ -56,14 +79,14 @@ public class BreakTorchGoal extends Goal {
 
     @Override
     public boolean canUse() {
-        if (this.cooldown > 0) {
-            this.cooldown--;
+        if (this.dragon.tickCount < this.nextBreakAllowedTick) {
             return false;
         }
         if (this.dragon.isSleeping()) {
             return false;
         }
         this.targetTorch = this.findNearbyTorch();
+        this.ticksOnTarget = 0;
         return this.targetTorch != null;
     }
 
@@ -92,6 +115,10 @@ public class BreakTorchGoal extends Goal {
         this.dragon.getLookControl().setLookAt(x, y, z);
 
         if (this.dragon.distanceToSqr(x, y, z) > REACH_DISTANCE * REACH_DISTANCE) {
+            if (++this.ticksOnTarget > GIVE_UP_TICKS) {
+                this.giveUp(torch);
+                return;
+            }
             if (this.dragon.tickCount % REPATH_INTERVAL == 0) {
                 this.moveToTorch();
             }
@@ -101,11 +128,20 @@ public class BreakTorchGoal extends Goal {
         // 够得着了：正常破坏（true = 产生掉落物），然后进冷却
         this.dragon.level().destroyBlock(torch, true);
         this.targetTorch = null;
-        this.cooldown = COOLDOWN_TICKS;
+        this.nextBreakAllowedTick = this.dragon.tickCount + COOLDOWN_TICKS;
     }
 
     @Override
     public void stop() {
+        this.targetTorch = null;
+        this.ticksOnTarget = 0;
+    }
+
+    /** 放弃这根够不着的火把：拉黑一段时间，同时进同样长的冷却。 */
+    private void giveUp(BlockPos torch) {
+        this.skippedTorch = torch;
+        this.skipUntilTick = this.dragon.tickCount + SKIP_TICKS;
+        this.nextBreakAllowedTick = this.skipUntilTick;
         this.targetTorch = null;
     }
 
@@ -115,6 +151,13 @@ public class BreakTorchGoal extends Goal {
             this.dragon.getNavigation().moveTo(
                     torch.getX() + 0.5D, torch.getY(), torch.getZ() + 0.5D, this.speedModifier);
         }
+    }
+
+    /** 这根火把是不是刚被拉黑、还没解禁。 */
+    private boolean isSkipped(BlockPos pos) {
+        return this.skippedTorch != null
+                && this.dragon.tickCount < this.skipUntilTick
+                && this.skippedTorch.equals(pos);
     }
 
     /** 在自身周围找最近的一个火把，找不到返回 {@code null}。 */
@@ -127,7 +170,7 @@ public class BreakTorchGoal extends Goal {
         BlockPos best = null;
         double bestDistance = Double.MAX_VALUE;
         for (BlockPos pos : BlockPos.betweenClosed(min, max)) {
-            if (!isTorch(level.getBlockState(pos))) {
+            if (this.isSkipped(pos) || !isTorch(level.getBlockState(pos))) {
                 continue;
             }
             double distance = this.dragon.distanceToSqr(
