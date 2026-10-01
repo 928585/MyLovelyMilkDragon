@@ -1,0 +1,30 @@
+{
+	"schemaVersion": 1,
+	"id": "mylovelymilkdragon",
+	"version": "${version}",
+	"name": "My Lovely Milk Dragon",
+	"description": "A cute-looking but mischievous milk dragon: it raids villages, breaks torches, naps anywhere, and holds a grudge against whoever hits it.",
+	"authors": [
+		"ninetwo"
+	],
+	"license": "CC0-1.0",
+	"icon": "assets/mylovelymilkdragon/icon.png",
+	"environment": "*",
+	"entrypoints": {
+		"main": [
+			"io.github.ninetwo.mdragon.Mylovelymilkdragon"
+		],
+		"client": [
+			"io.github.ninetwo.mdragon.client.MylovelymilkdragonClient"
+		]
+	},
+	"mixins": [
+		"mylovelymilkdragon.mixins.json"
+	],
+	"depends": {
+		"fabricloader": ">=0.19.5",
+		"minecraft": "~26.3",
+		"java": ">=25",
+		"fabric-api": "*"
+	}
+}
