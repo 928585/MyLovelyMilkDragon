@@ -154,14 +154,40 @@ if (this.is(EntityTypeTags.BURN_IN_DAYLIGHT)) {   // ← 由实体标签决定
 - `MobCategory` 生成上限常量：**MONSTER = 70，CREATURE = 10**
   （这是选 MONSTER 的实际好处：村庄里刷得出来）
 
-### 5.3 刷怪蛋
+### 5.3 物品注册：id 必须在 new 之前写进 Properties（**编译期看不出来，一启动就崩**）
 
-`SpawnEggItem` 构造函数只剩 `SpawnEggItem(Item.Properties)`，
-实体类型改走数据组件 `Item.Properties.spawnEgg(EntityType<?>)`：
+26.3 里 `Item` 的构造函数会调 `Properties.itemIdOrThrow()` 去拼翻译键
+（`descriptionId`），**拿不到就直接抛异常**：
+
+```
+java.lang.NullPointerException: Item id not set
+    at net.minecraft.world.item.Item$Properties.itemIdOrThrow(Item.java:459)
+    at net.minecraft.world.item.Item.<init>(Item.java:163)
+```
+
+本项目 2026-10-01 就是这么崩的（`ModItems.<clinit>`）。
+**这个坑 `compileJava` 完全查不出来，只有真启动游戏才会炸。**
+
+正确顺序：先建 key → `setId(key)` → 再 new 物品 → 最后注册。原版 `Items` 也这么写：
 
 ```java
-new SpawnEggItem(new Item.Properties().spawnEgg(ModEntities.MILK_DRAGON))
+private static Item register(String name, Function<Item.Properties, Item> factory) {
+    ResourceKey<Item> key = ResourceKey.create(Registries.ITEM, Mylovelymilkdragon.id(name));
+    return Registry.register(
+            BuiltInRegistries.ITEM, key, factory.apply(new Item.Properties().setId(key)));
+}
 ```
+
+刷怪蛋同理——`SpawnEggItem` 构造函数只剩 `SpawnEggItem(Item.Properties)`，
+实体类型走数据组件 `spawnEgg(...)`，但**一样要先 `setId`**：
+
+```java
+register("milk_dragon_spawn_egg",
+        properties -> new SpawnEggItem(properties.spawnEgg(ModEntities.MILK_DRAGON)));
+```
+
+⚠️ **教训：能编译 ≠ 能跑。** 注册类这种只在启动时执行一次的代码，
+改完一定要 `./gradlew runClient` 实际启动一次验证，别只看 `compileJava` 绿了就汇报。
 
 ### 5.4 药水与状态效果
 
@@ -412,6 +438,8 @@ src/main/resources/
 ### 已经能用的
 
 - 构建环境完整可用，`compileJava` 通过；git 仓库已建立
+- **`runClient` 实机验证通过**（2026-10-01 22:36）：模组加载无报错，
+  日志有 `[奶龙] 模组加载完成`，实体与物品注册均未抛异常
 - 注册骨架：`ModItems`、`ModEntities`、`ModPotions`（内容见第 11 节，部分待重做）
 - `onInitialize()` 已接线，三个 `registerXxx()` 都会调用；client 入口已挂上
 - `MilkDragonEntity`：属性、三状态机、只打村民、报复、跟踪、拆火把（阶段 2 完成）
