@@ -1,17 +1,21 @@
 package io.github.ninetwo.mdragon.client;
 
+import io.github.ninetwo.mdragon.ModEntities;
+import io.github.ninetwo.mdragon.client.render.MilkDragonRenderer;
 import net.fabricmc.api.ClientModInitializer;
+import net.minecraft.client.renderer.entity.EntityRenderers;
 
 /**
  * 客户端入口。
  *
- * <p>目前是空壳，阶段 3（客户端渲染）会在这里注册：
- * 奶龙的实体渲染器、模型层（ModelLayer），以及需要的客户端事件。
+ * <p>注册实体渲染器用的是原版 {@link EntityRenderers#register}，
+ * <b>不是</b> Fabric 的 {@code EntityRendererRegistry}——后者在 26.3 已标记
+ * {@code @Deprecated}，源码注释写着 "Replaced with transitive access wideners"。
  */
 public class MylovelymilkdragonClient implements ClientModInitializer {
 
     @Override
     public void onInitializeClient() {
-        // 阶段 3 在这里注册实体渲染器与模型层
+        EntityRenderers.register(ModEntities.MILK_DRAGON, MilkDragonRenderer::new);
     }
 }

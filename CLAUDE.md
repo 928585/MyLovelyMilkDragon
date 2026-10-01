@@ -277,6 +277,56 @@ return super.mobInteract(player, hand);
 `LevelWriter.destroyBlock(BlockPos, boolean dropBlock)` —— 第二参传 `true`
 就会正常产生掉落物 + 破坏音效粒子。破坏火把用它。
 
+### 5.13 火把的类谱系（26.3 已大改，别照抄旧版）
+
+26.3 里**没有 `SoulTorchBlock` 这个类了**。整个火把家族只剩两级：
+
+| 类 | 谁在用 |
+|---|---|
+| `BaseTorchBlock`（抽象） | 只被下面两个继承 |
+| └ `TorchBlock` | TORCH / SOUL_TORCH / **COPPER_TORCH**（铜火把是新增的） |
+| &nbsp;&nbsp;&nbsp;└ `WallTorchBlock` | WALL_TORCH / SOUL_WALL_TORCH / COPPER_WALL_TORCH |
+| └ `RedstoneTorchBlock` | REDSTONE_TORCH |
+| &nbsp;&nbsp;&nbsp;└ `RedstoneWallTorchBlock` | REDSTONE_WALL_TORCH |
+
+- 所以 `block instanceof TorchBlock` = **所有发光火把（含灵魂、铜、墙面版），不含红石火把**
+- 想连红石火把一起管，就改用 `instanceof BaseTorchBlock`
+- 用 `Blocks.TORCH` 之类的字段**判断不出类型**——javap 里它们的声明类型全是 `Block`，
+  要知道具体实现类得去看 `Blocks.<clinit>` 的 `new` 指令
+
+### 5.14 状态机该挂在 aiStep，不是 customServerAiStep（重要）
+
+- `Mob.serverAiStep()` 是 **`protected final`**，覆写不了；它内部按顺序调用
+  `targetSelector.tick()` → `goalSelector.tick()` → `navigation.tick()` → `customServerAiStep(ServerLevel)`
+- `customServerAiStep` 是常规的「每 tick 服务端 AI」扩展点，**但它属于 AI 的一部分**：
+  一旦用 `setNoAi(true)` 关掉 AI（睡觉就靠这个），它就不跑了
+- 所以自己维护的状态机（愤怒倒计时、睡醒判定）**要放在 `aiStep()`** ——
+  它是 `public`，双侧每 tick 必跑，且不受 `noAi` 影响。里面再判一次
+  `if (this.level() instanceof ServerLevel)` 隔离客户端
+- `setNoAi(true)` 会一并存进存档（`Mob.addAdditionalSaveData` 写的 `NoAI`），重启后仍生效
+
+### 5.15 运行时属性修饰符（愤怒加移速）
+
+```java
+AttributeModifier(Identifier, double, AttributeModifier.Operation)   // 是个 record
+instance.addOrUpdateTransientModifier(modifier);   // 瞬时：不进存档、不叠层
+instance.removeModifier(Identifier);
+```
+
+改移速**必须**用修饰符，不能去改 `Attributes.MOVEMENT_SPEED` 的基础值。
+用 transient 而不是 permanent，否则读档时会一层层叠上去。
+
+### 5.16 其它零碎
+
+- `Villager` 现在在 **`net.minecraft.world.entity.npc.villager.Villager`**
+  （多了中间的 `.villager` 包，`AbstractVillager` 也在那）
+- `NearestAttackableTargetGoal(Mob, Class<T>, boolean)`
+- `HurtByTargetGoal(PathfinderMob, Class<?>...)` —— 报复用，谁打它追谁
+- `Goal.Flag` 只有 `MOVE / LOOK / JUMP / TARGET` 四个
+- `BlockPos.betweenClosed(BlockPos, BlockPos)` 迭代出来的对象**会被复用**，
+  要留住必须 `.immutable()` 拷一份
+- 伤害的服务端入口是 `public boolean hurtServer(ServerLevel, DamageSource, float)`
+
 ## 6. 资源文件路径（已验证）
 
 ```
@@ -363,14 +413,17 @@ src/main/resources/
 
 - 构建环境完整可用，`compileJava` 通过；git 仓库已建立
 - 注册骨架：`ModItems`、`ModEntities`、`ModPotions`（内容见第 11 节，部分待重做）
-- `MilkDragonEntity` 雏形：属性、近战 AI、反击、随机漫步
+- `onInitialize()` 已接线，三个 `registerXxx()` 都会调用；client 入口已挂上
+- `MilkDragonEntity`：属性、三状态机、只打村民、报复、跟踪、拆火把（阶段 2 完成）
+- 渲染管线：`MilkDragonRenderer` + `MilkDragonRenderState`（阶段 3a，几何体借原版猪模型占位）
 
 ### 还没做的（重要）
 
-- [ ] 资源文件基本为空：无实体贴图/模型、无战利品表、无配方
+- [ ] **实体贴图一张都没有** —— 渲染器引用的两个 PNG 路径还不存在，游戏里会是紫黑格
+- [ ] 模型还是原版猪（`PigModel`），待阶段 3b 换成奶龙自己的
+- [ ] 无战利品表、无配方、无自然生成、无 `sounds.json`
 - [ ] `ExampleMixin` 是模板遗留物，注入 `MinecraftServer.loadLevel`，目前没用
-- [ ] 药水/效果仍是「龙息」旧命名，待按第 11 节改为「奶龙药水」
-- [ ] 全部音效仍是原版占位（符合第 9 节策略）
+- [ ] 药水内部效果仍叫「龙息」，**命名待定**（见 11.7），不阻塞开发
 - [ ] `README.md` 还是模板内容
 
 ## 11. 功能设计（定稿）
@@ -403,18 +456,36 @@ src/main/resources/
 
 | 状态 | 触发 | 表现 |
 |---|---|---|
-| `isAngry` | 被攻击累计到阈值，或睡觉时被打断 | 换贴图 + 换音效；移动速度 0.25 → 0.3；持续一段时间后平息 |
-| `isSleeping` | **随机发生，白天晚上都会** | 静止不动；被打或有玩家靠近则醒（醒 → 愤怒） |
+| `isAngry` | 挨打累计 3 下，或睡觉时被打断 | 换贴图 + 换音效；移动速度 0.25 → 0.3；30 秒后自动平息 |
+| `isSleeping` | **随机发生，白天晚上都会** | 静止不动（`setNoAi(true)`）；被打或有玩家靠近则醒（醒 → 愤怒） |
 | `isLaughing` | 随机 | 持续约 2 秒 |
+
+**三者的互斥关系**：愤怒会强制踢出睡觉和大笑；睡觉时笑不出来；睡觉/愤怒期间不推进入睡倒计时。
+愤怒期间和追击期间**都不会入睡**（否则会追到一半原地趴下），目标一丢倒计时继续走。
+
+**具体时长与半径**（都写在 `MilkDragonEntity` 顶部的常量区，改数值去那里）：
+
+| 常量 | 值 |
+|---|---|
+| `HITS_TO_BECOME_ANGRY` | 3 |
+| `ANGRY_DURATION_TICKS` | 30 秒 |
+| `LAUGH_DURATION_TICKS` | 2 秒 |
+| 两次大笑间隔 | 随机 20~60 秒 |
+| 两次入睡间隔 | 随机 30 秒 ~ 2 分钟 |
+| `WAKE_PLAYER_RADIUS` | 4 格 |
+| `ANGRY_SPEED_BONUS` | +0.05（0.25 → 0.3） |
 
 **行为**：
 
-- **跟踪**玩家和村民（靠近、注视），但**只主动攻击村民**
-- **不主动攻击玩家**
-- **被攻击时报复**：`HurtByTargetGoal` —— **谁打的他就追杀谁**，
+- **跟踪**玩家和村民（凑近到 3 格内就停下注视），但**只主动攻击村民**（`TrackNearestGoal`）
+- **不主动攻击玩家**：`targetSelector` 里根本没有 `NearestAttackableTargetGoal<Player>`
+- **被攻击时报复**：`HurtByTargetGoal` —— **谁打的他就追杀谁**，不限定生物类型；
   不是无差别攻击（不会去屠村里的牲畜）
-- **破坏火把**：范围**周围 4 格**、冷却 **5 秒**、**所有**火把（立式 + 壁挂）
-  都会被破坏，且**产生掉落物**（`level.destroyBlock(pos, true)`）
+- **破坏火把**：范围**周围 4 格**（上下 2 格）、冷却 **5 秒**、走正常破坏流程
+  **产生掉落物**（`level.destroyBlock(pos, true)`），见 `BreakTorchGoal`
+  - 「火把」= `instanceof TorchBlock`：普通 / 灵魂 / **铜火把**的立式与壁挂版，
+    **不含红石火把**（那是红石元件，走 `RedstoneTorchBlock` 另一条线）。
+    想连红石火把一起拆就改成 `BaseTorchBlock`，见 5.13
 - 防溺水上浮、随机漫步
 - 音效：阶段 2/3 用原版占位，见第 9 节
 
@@ -466,18 +537,23 @@ src/main/resources/
 | 药水翻译键 | `item.minecraft.potion.effect.milk_dragon` |
 | 显示名 | 奶龙药水 / Potion of Milk Dragon |
 | 酿造配方 | 粗制的药水 + 奶龙鳞片 → 奶龙药水（阶段 6a 实现） |
+| 内部效果 | 暂沿用旧的 `effect.mylovelymilkdragon.dragon_breath`（「龙息」），**命名待定**，见 11.7 |
 
-⚠️ **待确认**：药水内部**效果的 id 和显示名**目前仍是旧的
-`effect.mylovelymilkdragon.dragon_breath`（「龙息」），尚未随药水一起改名。
+药水**本身**的名字已定稿（奶龙药水），只是它内部那个**状态效果**的名字还没想好，
+先按旧名跑着，不阻塞任何开发。
 
-### 11.7 已放弃 / 预留
+### 11.7 待定 / 已放弃 / 预留
+
+> **待定**项：用户还没想好，先不定。**不要为了填坑而自由发挥**——
+> 按现有旧名跑着即可，等用户明确后再改。
 
 | 项 | 状态 |
 |---|---|
+| 药水内部**效果**的 id 与显示名 | 🟡 **待定**（暂沿用 `dragon_breath`／「龙息」） |
+| 召唤事件（指令 / 奶蛋触发，可飞行的奶龙） | 🟡 **待定**，暂不做 |
+| 奶龙祭坛（结构） | 🟡 **待定**，暂不做 |
 | 头颅做成方块 | ❌ **放弃**（见 5.8，泥潭；原版三种头颅走同一段硬编码） |
 | 视野变黄 | ❌ **放弃**（见 5.9，无扩展点；用户同意不做） |
-| 召唤事件（指令 / 奶蛋触发，可飞行的奶龙） | 🔜 预留，暂不做 |
-| 奶龙祭坛（结构） | 🔜 预留，暂不做 |
 
 ## 12. 阶段划分（一次对话做一块，按依赖顺序）
 
@@ -485,8 +561,9 @@ src/main/resources/
 |---|---|---|
 | **0** | 接线 + 资源骨架：`onInitialize()`、`fabric.mod.json`、client 入口、lang | ✅ 已完成 |
 | **1** | 实体骨架：属性表、MONSTER 类别、`fireImmune`、同步状态定义 | ✅ 已完成 |
-| **2** | AI 与行为：三状态、跟踪/攻击目标、报复、打火把、随机睡觉、愤怒改移速 | ⬜ |
-| **3** | 客户端渲染：RenderState + Renderer + Model + 平时/愤怒两套贴图 | ⬜ |
+| **2** | AI 与行为：三状态、跟踪/攻击目标、报复、打火把、随机睡觉、愤怒改移速 | ✅ 已完成 |
+| **3a** | 渲染管线：RenderState + Renderer 注册（几何体借原版猪模型占位） | ✅ 已完成 |
+| **3b** | 自定义奶龙模型 + 平时/愤怒两套贴图 | ⬜ |
 | **4** | 掉落 + 奶龙头（可佩戴物品）：战利品表、头物品、`convertTo` 同化村民 | ⬜ |
 | **5** | 自然生成：村庄高概率 + 野外低概率，均无视光照 | ⬜ |
 | **6a** | 奶龙药水 + 酿造配方 | ⬜ |
