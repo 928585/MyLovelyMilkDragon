@@ -14,12 +14,20 @@ public class ModEntities {
     public static final ResourceKey<EntityType<?>> MILK_DRAGON_KEY = ResourceKey.create(
             Registries.ENTITY_TYPE, Mylovelymilkdragon.id("milk_dragon"));
 
-    // 注册“奶龙”的实体类型
+    // 注册「奶龙」的实体类型。
+    //
+    // 关于两个容易踩的坑（都已核实，见 CLAUDE.md 第 5.2 节）：
+    //   - MONSTER 类别【不会】导致白天自燃。自燃由实体标签 #minecraft:burn_in_daylight 决定，
+    //     我们不加那个标签，所以奶龙白天安全。
+    //   - MONSTER 类别【不会】导致和平难度消失。那不是由类别决定的，而是由
+    //     notInPeaceful() 决定的；我们故意不调用它，奶龙在和平难度下照常存在。
+    //   - 选 MONSTER 的实际好处：生成上限是 70，而 CREATURE 只有 10，村庄里才刷得出来。
     public static final EntityType<MilkDragonEntity> MILK_DRAGON = Registry.register(
             BuiltInRegistries.ENTITY_TYPE,
             MILK_DRAGON_KEY,
-            EntityType.Builder.<MilkDragonEntity>of(MilkDragonEntity::new, MobCategory.CREATURE)
-                    .sized(1.0F, 1.5F) // 碰撞箱：宽1格，高1.5格
+            EntityType.Builder.<MilkDragonEntity>of(MilkDragonEntity::new, MobCategory.MONSTER)
+                    .sized(1.0F, 1.5F) // 碰撞箱：宽 1 格，高 1.5 格
+                    .fireImmune()      // 免疫火焰与岩浆
                     .build(MILK_DRAGON_KEY)
     );
 
