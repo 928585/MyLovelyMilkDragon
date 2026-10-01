@@ -30,7 +30,20 @@ Minecraft **26.3** 是很新的版本，你的训练数据里几乎肯定没有�
 | 版本 / group | `1.0.0` / `io.github.ninetwo.mdragon` |
 | 许可 | CC0-1.0 |
 | 工作区 | `E:\Java\mcmods\mylovelymilkdragon-template-26.3` |
-| 版本控制 | **git 仓库**（2026-10-01 初始化），计划推 GitHub |
+| 版本控制 | **git 仓库**，默认分支 `main`（2026-10-01 初始化） |
+| GitHub | https://github.com/928585/MyLovelyMilkDragon |
+| 作者 | `928585`（`fabric.mod.json` 的 `authors` 是自由文本，写什么都行） |
+
+**网络**：本机走 Windows 系统代理 `127.0.0.1:7897`（Clash），但 Git Bash 不继承该设置，
+所以 git 推送需要单独配代理（已配在本仓库的 local config，只影响本仓库）：
+
+```bash
+git config --local http.proxy http://127.0.0.1:7897
+git config --local https.proxy http://127.0.0.1:7897
+# 若想让所有仓库都用，把 --local 换成 --global
+```
+
+凭据由系统级的 Git Credential Manager 处理，首次 `git push` 会弹窗要求登录 GitHub。
 
 ## 2. 版本矩阵与环境（已验证）
 
@@ -413,7 +426,7 @@ src/main/resources/
 | `milk_dragon_head` | 奶龙头 | **只做可佩戴物品，不做方块**（见 5.8）。`equippableUnswappable(HEAD)`；戴上有绑定诅咒；每 5 秒大笑；右键村民/灾厄村民/女巫 → 戴上 → 30 秒后**同化成奶龙** |
 | `milk_dragon_scale` | 奶龙鳞片 | 酿造原料 |
 | `milk_dragon_spawn_egg` | 奶龙刷怪蛋 | |
-| `milk_dragon_milk` | **奶龙的奶** | ⚠️ 注册 id 为暂定，见 11.6 |
+| `milk_dragon_milk` | **奶龙的奶** | 详见 11.3 |
 | （原版 `minecraft:sulfur`） | 硫磺 | **直接用原版物品**，不自己注册 |
 
 ### 11.3 奶龙的奶（`milk_dragon_milk`）
@@ -445,11 +458,17 @@ src/main/resources/
 
 ### 11.6 药水
 
-**奶龙药水**（不是「龙息药水」，是一种新的特殊药水）。
-酿造配方：**粗制的药水 + 奶龙鳞片 → 奶龙药水**。
+**奶龙药水**，一种新的特殊药水（不是「龙息药水」）。
 
-⚠️ 待定：药水与内部效果的**注册 id 和显示名**目前仍是旧的 `dragon_breath`。
-做阶段 6a 时需要定下来（药水翻译键是 `item.minecraft.potion.effect.<名字>`）。
+| 项 | 值 |
+|---|---|
+| 药水注册 id | `mylovelymilkdragon:milk_dragon` |
+| 药水翻译键 | `item.minecraft.potion.effect.milk_dragon` |
+| 显示名 | 奶龙药水 / Potion of Milk Dragon |
+| 酿造配方 | 粗制的药水 + 奶龙鳞片 → 奶龙药水（阶段 6a 实现） |
+
+⚠️ **待确认**：药水内部**效果的 id 和显示名**目前仍是旧的
+`effect.mylovelymilkdragon.dragon_breath`（「龙息」），尚未随药水一起改名。
 
 ### 11.7 已放弃 / 预留
 
@@ -465,7 +484,7 @@ src/main/resources/
 | 阶段 | 内容 | 状态 |
 |---|---|---|
 | **0** | 接线 + 资源骨架：`onInitialize()`、`fabric.mod.json`、client 入口、lang | ✅ 已完成 |
-| **1** | 实体骨架：属性表、MONSTER 类别、`fireImmune`、同步状态定义 | ⬜ |
+| **1** | 实体骨架：属性表、MONSTER 类别、`fireImmune`、同步状态定义 | ✅ 已完成 |
 | **2** | AI 与行为：三状态、跟踪/攻击目标、报复、打火把、随机睡觉、愤怒改移速 | ⬜ |
 | **3** | 客户端渲染：RenderState + Renderer + Model + 平时/愤怒两套贴图 | ⬜ |
 | **4** | 掉落 + 奶龙头（可佩戴物品）：战利品表、头物品、`convertTo` 同化村民 | ⬜ |

@@ -5,8 +5,12 @@
 	"name": "My Lovely Milk Dragon",
 	"description": "A cute-looking but mischievous milk dragon: it raids villages, breaks torches, naps anywhere, and holds a grudge against whoever hits it.",
 	"authors": [
-		"ninetwo"
+		"928585"
 	],
+	"contact": {
+		"homepage": "https://github.com/928585/MyLovelyMilkDragon",
+		"sources": "https://github.com/928585/MyLovelyMilkDragon"
+	},
 	"license": "CC0-1.0",
 	"icon": "assets/mylovelymilkdragon/icon.png",
 	"environment": "*",
