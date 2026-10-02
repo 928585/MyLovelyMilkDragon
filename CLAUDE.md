@@ -113,8 +113,12 @@ unzip -p "$JAR" assets/minecraft/items/diamond.json
 find ~/.gradle/caches/modules-2/files-2.1/net.fabricmc.fabric-api -name "*sources.jar"
 ```
 
-另外：`./gradlew genSources` **还没跑过**。跑一次会生成反编译源码，
-以后在 IDE 里能直接跳转阅读原版实现，比看字节码舒服得多，建议尽早执行。
+另外：`./gradlew genSources` **已经跑过了**，反编译源码在
+`.gradle/loom-cache/minecraftMaven/net/minecraft/minecraft-merged-*/26.3/*-sources.jar`，
+解压出来约 7300 个 `.java`（本项目解在 `build/mcsrc`）。
+想读原版某个方法的真实实现，**优先读源码而不是 javap 的字节码**，快得多
+（5.28 那几个坑全是这么查出来的）。5.31 里讲 `javap` 的地方，只适用于
+「要确认某个符号在字节码里的**准确描述符**」这种场景。
 
 ## 5. 已核实的 26.3 API 变更（踩过的坑，别再踩）
 
@@ -1422,8 +1426,24 @@ src/main/resources/
 ./gradlew compileJava    # 只编译 Java（改完代码的快速自检）
 ./gradlew build          # 完整构建，产物在 build/libs/
 ./gradlew runClient      # 启动客户端（游戏数据在 run/）
-./gradlew genSources     # 生成反编译源码（还没跑过，建议跑）
+./gradlew genSources     # 生成反编译源码（已跑过，源码在 build/mcsrc）
 ```
+
+### ⚠️ 关掉 `runClient` 时，杀 gradle wrapper 不会连带杀掉游戏进程
+
+客户端是 wrapper **另起**的 `java.exe`，把 wrapper 停掉之后它会继续活着 ——
+窗口留在用户屏幕上，而且会占着 `run/` 不放，下一次 `runClient` 可能起不来。
+
+关干净的办法（Git Bash）：
+
+```bash
+# 找出跑着 Fabric 的那个 java 进程
+powershell -NoProfile -Command "Get-CimInstance Win32_Process -Filter \"Name='java.exe'\" \
+  | Where-Object { \$_.CommandLine -like '*net.fabricmc*' } | Select-Object -ExpandProperty ProcessId"
+powershell -NoProfile -Command "Stop-Process -Id <PID> -Force"
+```
+
+**关完一定要复查一次**（同一条查询命令，返回空才算干净），2026-10-02 踩过。
 
 **收尾规矩：每轮对话改完代码，必须跑一次 `./gradlew compileJava` 并确认
 `BUILD SUCCESSFUL`，再向用户汇报。** 不要只说「改好了」而不编译。
