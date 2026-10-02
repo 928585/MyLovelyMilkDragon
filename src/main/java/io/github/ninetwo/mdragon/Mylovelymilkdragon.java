@@ -13,11 +13,20 @@ public class Mylovelymilkdragon implements ModInitializer {
 
     @Override
     public void onInitialize() {
-        // 注册顺序有讲究：ModItems 里有刷怪蛋引用了 ModEntities.MILK_DRAGON 这个静态字段，
-        // 所以必须先让 ModEntities 完成类加载与注册，再加载 ModItems。
+        // 注册顺序有讲究：
+        //   1. ModDataComponents 自定义数据组件，必须走在用它的物品前面
+        //   2. ModEntities 紧随其后：后面的刷怪蛋和自然生成都要引用它的静态字段
+        //   3. ModSpawns 依赖 ModEntities.MILK_DRAGON
+        //   4. ModItems 里有刷怪蛋引用了 ModEntities.MILK_DRAGON 这个静态字段
+        //   5. ModCreativeTabs 的物品栏内容引用了 ModItems / ModBlocks / ModPotions
+        //      三家，必须排在最后
+        ModDataComponents.registerModDataComponents();
         ModEntities.registerModEntities();
+        ModSpawns.registerModSpawns();
+        ModBlocks.registerModBlocks();
         ModItems.registerModItems();
         ModPotions.registerModPotions();
+        ModCreativeTabs.registerModCreativeTabs();
 
         LOGGER.info("[奶龙] 模组加载完成");
     }
