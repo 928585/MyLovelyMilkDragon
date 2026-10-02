@@ -397,6 +397,790 @@ damage <目标> <伤害>
 # 返回 1b = 生效中，0b = 没有
 ```
 
+### 5.19 实体类型常量在 `EntityTypes`（复数），不在 `EntityType`（**最容易踩**）
+
+26.3 里 `net.minecraft.world.entity.EntityType` **只剩类本身**，整个类里只有 3 个
+`public static final` 字段。`PLAYER` / `VILLAGER` / `ZOMBIE` 这些常量统统搬到了：
+
+```java
+net.minecraft.world.entity.EntityTypes.PLAYER      // ← 复数！跟 Items / Blocks 一个风格
+net.minecraft.world.entity.EntityTypes.VILLAGER
+net.minecraft.world.entity.EntityTypes.WITCH
+```
+
+写 `EntityType.VILLAGER` 会直接编译不过，而且这个错误在照着旧教程抄的时候特别隐蔽。
+
+顺带核实过：**`SoundEvents` / `Items` / `Blocks` / `MobEffects` / `Enchantments` 都没搬家**，
+常量数量分别是 1904 / 1253 / 911 / 40 / 43，只有 `EntityType` 被拆了。
+
+### 5.20 装备栏里的物品每 tick 都会被 tick（不用 Mixin、不用全局事件）
+
+想「某生物戴着某物品时每 tick 做点什么」，26.3 有现成的钩子，别去写 Mixin：
+
+```
+LivingEntity.tick()
+  └─ EntityEquipment.tick(this)          // 遍历全部装备槽
+       └─ ItemStack.inventoryTick(level, entity, slot)
+            └─ Item.inventoryTick(stack, serverLevel, entity, slot)   // ← 你的覆写点
+```
+
+- **任何 `LivingEntity`（含全部 `Mob`）** 只要装备槽里有东西，每 tick 都会走到
+- 转发到 `Item.inventoryTick` 时**已经判过 `instanceof ServerLevel`**，所以那里只会被服务端调用
+- ⚠️ 26.3 签名是 **`inventoryTick(ItemStack, ServerLevel, Entity, EquipmentSlot)`**，
+  不是旧版的 `(ItemStack, Level, Entity, int, boolean)`
+- 拿「现在是第几刻」用 `level.getLevelData().getGameTime()`（`Level.getLevelData()` 返回
+  `LevelData`，上面有 `getGameTime()`）。**不要用 `entity.tickCount`**——它不进存档，读档归零
+
+**推论：倒计时别每 tick 写组件。** 写组件会同步给客户端，20 包/秒纯属浪费。
+存「截止的游戏刻」而不是「还剩多少」，戴上时写一次，之后只读不写。
+
+### 5.21 装备组件：原版自带「右键给生物戴上」
+
+`ItemStack.interactLivingEntity` 的逻辑（已读字节码）：
+
+```java
+Equippable equippable = get(DataComponents.EQUIPPABLE);
+if (equippable != null && equippable.equipOnInteract()) {
+    InteractionResult r = equippable.equipOnTarget(player, target, this);
+    if (r != InteractionResult.PASS) return r;   // 成功就不再往下走
+}
+return getItem().interactLivingEntity(this, player, target, hand);
+```
+
+调用链是 `Mob.interact` → `Mob.checkAndHandleImportantInteractions` → 上面这段，
+**在 `mobInteract` 之前**。所以「右键村民 → 给村民戴帽子」不需要自己写代码，
+也不用 Mixin 村民的 `mobInteract`（跟 5.7 的治愈僵尸村民是两回事）。
+
+```java
+Equippable.builder(EquipmentSlot.HEAD)
+        .setSwappable(false)          // 等价于 equippableUnswappable(HEAD)
+        .setEquipOnInteract(true)     // 打开右键佩戴
+        .setAllowedEntities(EntityTypes.PLAYER, EntityTypes.VILLAGER, ...)
+        .build()
+```
+
+⚠️ **`allowedEntities` 里必须写 `EntityTypes.PLAYER`。** 玩家自己往头上戴走的是
+`Equippable.swapWithEquipmentSlot` → `canBeEquippedBy(player.typeHolder())`，
+限制名单时不写玩家，玩家反而戴不上。而 `equipOnTarget` 走的是
+`LivingEntity.isEquippableInSlot` → 同样会 `canBeEquippedBy`，所以这张名单
+**同时**是「谁能戴」和「能给谁戴」的名单。
+
+- `Equippable.Builder` 不设 `equipSound` 时默认是 `ARMOR_EQUIP_GENERIC`
+- `equipOnTarget` 内部已经处理了客户端/服务端（`level().isClientSide()` 判断）
+  和对 `Mob` 的 `setGuaranteedDrop(slot)`
+  - 副作用值得利用：戴着自定义头的怪**死了会把头掉出来**，不会凭空蒸发
+
+⚠️ **包名是 `net.minecraft.world.item.equipment.Equippable`**，不是
+`net.minecraft.world.entity.Equippable`。它是数据组件（是个 `record`），
+放在 `world/item/equipment/` 下；`entity/` 包下没有这个类。
+
+`equipOnTarget` 的准入条件只有三条（已读字节码），**它自己不查 `allowedEntities`**：
+
+```java
+if (target.isEquippableInSlot(stack, this.slot)   // ← 名单是在这里头查的
+        && !target.hasItemInSlot(this.slot)        // 槽位必须是空的
+        && target.isAlive()) {
+    ...  target.setItemSlot(this.slot, stack.split(1));   // 只取 1 个
+}
+return InteractionResult.PASS;
+```
+
+`isEquippableInSlot` 内部：
+
+```java
+return slot == equippable.slot()
+        && canUseSlot(equippable.slot())
+        && equippable.canBeEquippedBy(this.typeHolder());   // ← allowedEntities 真正生效处
+```
+
+因为 `equipOnTarget` 第一步就调 `isEquippableInSlot`，名单**间接**照样管用；
+只是别去 `equipOnTarget` 里找 `allowedEntities`，会以为没生效。
+
+### 5.22 给物品挂附魔：必须用 `delayedComponent`
+
+附魔是**动态注册表**，凑一个 `ItemEnchantments` 需要 `Holder<Enchantment>`，
+而物品是在类静态初始化里注册的，那时候注册表还没加载完——**拿不到 Holder**。
+
+解法是 `Item.Properties.delayedComponent`：
+
+```java
+public <T> Item.Properties delayedComponent(DataComponentType<T> type,
+        DataComponentInitializers.SingleComponentInitializer<T> initializer)
+// SingleComponentInitializer<C> { C create(HolderLookup.Provider registries); }
+```
+
+原版会在**加载期**带着 `HolderLookup.Provider` 跑一遍这个 initializer，那时注册表已经齐了：
+
+```java
+.delayedComponent(DataComponents.ENCHANTMENTS, registries -> {
+    ItemEnchantments.Mutable mutable = new ItemEnchantments.Mutable(ItemEnchantments.EMPTY);
+    mutable.set(registries.lookupOrThrow(Registries.ENCHANTMENT)
+            .getOrThrow(Enchantments.BINDING_CURSE), 1);
+    return mutable.toImmutable();
+})
+```
+
+- `ItemEnchantments` 是**不可变**的，没有公开构造函数，只有 `EMPTY` 和几个只读方法
+  → 想造一个出来只能借道 `ItemEnchantments.Mutable(ItemEnchantments)` + `set(...)` + `toImmutable()`
+- `Enchantments.BINDING_CURSE` 的类型是 `ResourceKey<Enchantment>`，**不是** `Holder<Enchantment>`
+- `HolderLookup.Provider.lookupOrThrow(ResourceKey)` → `RegistryLookup<T>`（继承 `HolderGetter<T>`）
+  → `getOrThrow(ResourceKey<T>)` 返回 `Holder.Reference<T>`
+- **绑定诅咒是靠附魔效果组件 `EnchantmentEffectComponents.PREVENT_ARMOR_CHANGE` 生效的**，
+  原版 `swapWithEquipmentSlot` 里就是查这个（创造模式除外）
+
+### 5.23 战利品表 JSON（26.3 格式，字段名变了）
+
+放 `data/<ns>/loot_table/entities/<实体名>.json`。
+
+**实体怎么找到这张表：** `EntityType.Builder` 里有个 `lootTable` 字段，类型是 `DependantName`
+——**从实体 id 自动派生**，不用手动指定。只有调了 `noLootTable()` 才会没有。
+我们的奶龙没调，所以只要文件放对路径就自动生效。
+
+26.3 的字段名跟旧教程不一样，**单数**：
+
+| 旧写法 | 26.3 |
+|---|---|
+| `"functions": [...]` | **`"modifier": [...]`** |
+| `"conditions": [...]` | **`"condition": {...}`**（单个对象，不是数组） |
+
+`LootTable` 本体只有 4 个字段：`type` / `pools` / `random_sequence` / `modifier`。
+原版 1447 张表**全都**写了 `random_sequence`，照写别省。
+
+常用片段（都从原版表里抄的，可直接用）：
+
+```jsonc
+// 定数量
+{ "type": "minecraft:set_count",
+  "count": { "type": "minecraft:uniform", "min": 1, "max": 2 } }
+
+// 抢夺每级 +0~1 个
+{ "type": "minecraft:enchanted_count_increase",
+  "count": { "type": "minecraft:uniform", "min": 0.0, "max": 1.0 },
+  "enchantment": "minecraft:looting" }
+
+// 概率掉落 + 抢夺加成（base 是「1 级时的概率」，不是 0 级）
+{ "type": "minecraft:random_chance_with_enchanted_bonus",
+  "enchantment": "minecraft:looting",
+  "unenchanted_chance": 0.15,
+  "enchanted_chance": { "type": "minecraft:linear", "base": 0.16, "per_level_above_first": 0.01 } }
+
+// 判断死因（爆炸 / 火焰 / 摔落……）
+// ⚠️ "id" 必须带 # 前缀，否则会被当成【单个伤害类型 id】去查注册表，然后解析失败
+// 字段名是 id + expected（expected: false 表示「不属于这个标签」）
+{ "type": "minecraft:damage_source_properties",
+  "predicate": { "tags": [ { "expected": true, "id": "#minecraft:is_explosion" } ] } }
+```
+
+- `condition` 可以放在 **pool 级**（跟 `entries`/`rolls` 平级）也可以放在 **entry 级**
+- 伤害来源标签写在 `data/minecraft/tags/damage_type/` 下，
+  比如 `is_explosion` = fireworks / explosion / player_explosion / bad_respawn_point
+- 别的常用标签：`is_fire` / `is_projectile` / `is_fall` / `is_drowning` / `bypasses_armor`
+- 找原版真实写法：`data/minecraft/enchantment/` 下**每个保护类附魔**都用了这个条件，
+  最标准的参照是 `blast_protection.json`（爆炸保护，正好就是 `#minecraft:is_explosion`）
+- 确认实体掉落上下文里有 `DAMAGE_SOURCE`：`LivingEntity.dropFromLootTable` 写进去的参数是
+  `THIS_ENTITY` / `ORIGIN` / `DAMAGE_SOURCE` / `ATTACKING_ENTITY` /
+  `DIRECT_ATTACKING_ENTITY` / `LAST_DAMAGE_PLAYER`
+
+> ⚠️ **战利品表写错会连累整个世界的加载。** 本项目 2026-10-01 踩过一次：
+> `id` 少了 `#`，日志报
+> `Failed to parse mylovelymilkdragon:entities/milk_dragon` +
+> `Failed to load level data or datapacks, can't proceed with server load`，
+> **世界直接进不去**（不是「少掉一件东西」那么轻）。
+> 所以改完战利品表**必须真的进一次世界**看日志，光编译过、光 JSON 语法合法都没用。
+
+#### 文件路径是怎么派生的（已逐字节核实，两边前缀不一样）
+
+实体和方块的掉落表**都不用手动指定**，各自从自己的 id 自动拼出来，
+但**前缀一个是 `entities/`、一个是 `blocks/`**：
+
+```java
+// EntityType.Builder 里
+ResourceKey.create(Registries.LOOT_TABLE, id.identifier().withPrefix("entities/"))
+
+// BlockBehaviour.Properties 里（字段 drops，是个 DependantName）
+ResourceKey.create(Registries.LOOT_TABLE, id.identifier().withPrefix("blocks/"))
+```
+
+| 对象 | 注册 id | 自动派生的键 | 文件放哪 |
+|---|---|---|---|
+| 实体 | `mylovelymilkdragon:milk_dragon` | `mylovelymilkdragon:entities/milk_dragon` | `data/mylovelymilkdragon/loot_table/entities/milk_dragon.json` |
+| 方块 | `mylovelymilkdragon:milk_dragon_egg` | `mylovelymilkdragon:blocks/milk_dragon_egg` | `data/mylovelymilkdragon/loot_table/blocks/milk_dragon_egg.json` |
+
+- 实体那边靠 `EntityType.Builder` 的 `lootTable` 字段，**调了 `noLootTable()` 才会没有**
+- 方块那边靠 `BlockBehaviour.Properties.drops`，同理是 `noLootTable()` / `overrideLootTable(...)`
+- 两边都读了「没设 id 就抛异常」的分支（方块那边报的是 **`Block id not set`**），
+  又一次说明 `setId` 是硬性要求
+
+### 5.24 自定义数据组件
+
+```java
+public static final DataComponentType<Long> XXX = Registry.register(
+        BuiltInRegistries.DATA_COMPONENT_TYPE,
+        Mylovelymilkdragon.id("xxx"),
+        DataComponentType.<Long>builder().persistent(Codec.LONG).build());
+```
+
+- `Registry.register(Registry<V>, Identifier, T extends V)` —— 泛型够宽，直接返回 `DataComponentType<T>`
+- **`.persistent(Codec)` 不能省**，不然组件进不了存档
+- 想要客户端也能读到就再加 `.networkSynchronized(StreamCodec)`
+
+### 5.25 方块与方块物品：26.3 是**两步注册**，而且翻译键前缀不一样
+
+**方块和它的方块物品是两样东西，要分别注册。** 原版 `Blocks` 只注册方块本体，
+方块物品统一丢在 `Items` 里用一个私有的 `registerBlock` 注册：
+
+```java
+// Blocks 里的（public，可以直接调用）
+public static Block register(ResourceKey<Block> key, Function<Properties, Block> factory, Properties props) {
+    Block block = factory.apply(props.setId(key));      // ← setId 是它帮你调的
+    return Registry.register(BuiltInRegistries.BLOCK, key, block);
+}
+
+// Items 里的（private，抄它的写法）
+private static Item registerBlock(BlockItemId id, Block block, BiFunction<Block, Properties, Item> factory,
+        Properties props) {
+    return registerItem(id.item(), p -> factory.apply(block, p),
+            props.useBlockDescriptionPrefix()               // ← 关键差异
+                 .requiredFeatures(block.requiredFeatures()));
+}
+```
+
+自己写的时候合到一起最省事：
+
+```java
+ResourceKey<Block> blockKey = ResourceKey.create(Registries.BLOCK, Mylovelymilkdragon.id(name));
+Block block = Registry.register(BuiltInRegistries.BLOCK, blockKey,
+        factory.apply(properties.setId(blockKey)));
+
+ResourceKey<Item> itemKey = ResourceKey.create(Registries.ITEM, Mylovelymilkdragon.id(name));
+Registry.register(BuiltInRegistries.ITEM, itemKey,
+        new BlockItem(block, new Item.Properties().setId(itemKey).useBlockDescriptionPrefix()));
+```
+
+⚠️ **三个都核实过、都会踩的点：**
+
+- `BlockBehaviour.Properties.setId(ResourceKey<Block>)` 是 **public**，且跟 5.3 的
+  `Item.Properties.setId` 一样**必须在构造方块之前调用**，否则构造函数拼不出翻译键
+- `Item.Properties.useBlockDescriptionPrefix()` 让方块物品的翻译键走
+  **`block.<命名空间>.<路径>`**，不是 `item.*`。原版龙蛋的键就是
+  `block.minecraft.dragon_egg`（读 `assets/minecraft/lang/en_us.json` 确认过）。
+  **漏了这个，方块物品在游戏里会显示成原始键名**
+- `BlockItem` 的构造函数还是老样子：`BlockItem(Block, Item.Properties)`
+
+**能直接复用的原版方块：** 想要「原版行为」时先看目标方块类的构造函数是不是 `public`。
+比如 `DragonEggBlock(BlockBehaviour.Properties)` 就是 public，直接 `new` 即可拿到
+「受重力掉落 + 被打瞬移」全套行为，一行逻辑都不用抄。
+
+### 5.26 创造模式物品栏：原版要坐标，Fabric 有免坐标封装
+
+⚠️ **26.3 的原版 builder 变成了 `CreativeModeTab.builder(Row, int)`** —— 要自己指定
+第几行第几列：
+
+```java
+public static CreativeModeTab.Builder builder(CreativeModeTab.Row row, int column)
+// Row 是枚举，只有 TOP / BOTTOM 两个值
+```
+
+而原版 **TOP 和 BOTTOM 两行的 0~6 列已经排满了**（TOP：建筑/颜色/自然/功能/红石/快捷栏/搜索；
+BOTTOM：战斗/工具/食物/材料/刷怪蛋/管理员/生存物品栏）。要去抢第 7 列就会跟别的模组撞车。
+
+**正确做法是用 Fabric 的封装，它是无参的：**
+
+```java
+import net.fabricmc.fabric.api.creativetab.v1.FabricCreativeModeTab;
+
+Registry.register(
+        BuiltInRegistries.CREATIVE_MODE_TAB,
+        TAB_KEY,
+        FabricCreativeModeTab.builder()                    // ← 无参！
+                .title(Component.translatable("itemGroup.<命名空间>.<路径>"))
+                .icon(() -> new ItemStack(ModBlocks.MILK_DRAGON_EGG))
+                .displayItems((parameters, output) -> {
+                    output.accept(ModItems.MILK_DRAGON_SCALE);
+                    output.accept(ModBlocks.MILK_DRAGON_EGG);   // 方块物品直接传方块
+                })
+                .build());
+```
+
+- 包名是 **`net.fabricmc.fabric.api.creativetab.v1`**。旧版 Fabric 叫
+  `api.itemgroup.v1.FabricItemGroup`，**照旧教程写会找不到类**
+- 内部实现是 `super(null, -1)`，真正的摆位由 Fabric 打在
+  `CreativeModeInventoryScreen` 上的分页逻辑（`FabricCreativeGuiComponents`）处理
+- `FabricCreativeModeTabBuilderImpl.build()` 会检查有没有设过 `title`，
+  没设直接抛 `IllegalStateException`
+- `displayItems` 的参数是 `(ItemDisplayParameters, CreativeModeTab.Output)`，
+  `Output.accept(ItemLike)` 就行
+
+**药水不能直接 `output.accept(Items.POTION)`** —— 那只会得到一瓶普通水瓶。
+必须带上药水组件：
+
+```java
+output.accept(PotionContents.createItemStack(Items.POTION, ModPotions.MILK_DRAGON_POTION));
+// public static ItemStack createItemStack(Item, Holder<Potion>)
+```
+
+#### ⚠️ 模组刷怪蛋**不会**自动进原版「刷怪蛋」页签
+
+**「搜索找得到」≠「页签里有」**，这俩是两回事，别被搜索骗了：
+
+- 搜索页签扫的是**整个物品注册表**，所以任何注册过的物品都搜得到
+- 而「刷怪蛋」页签的内容是**硬编码**的一长串
+  `spawnEggs.accept(Items.XXX_SPAWN_EGG)`（`CreativeModeTabs` 的 `SPAWN_EGGS` 分支，
+  26.3 里从 `Items.SPAWNER` 一路写到 `Items.SHULKER_SPAWN_EGG`）
+- **Fabric 也没有自动兜底**（翻遍 fabric 源码，只有 `CreativeModeTabsMixin`
+  在做分页和重名检测，没有碰刷怪蛋列表）
+
+正确做法是用 Fabric 的事件往那个页签里插（`ModCreativeTabs` 里就有现成的例子）：
+
+```java
+import net.fabricmc.fabric.api.creativetab.v1.CreativeModeTabEvents;
+import net.minecraft.world.item.CreativeModeTabs;
+
+CreativeModeTabEvents.modifyOutputEvent(CreativeModeTabs.SPAWN_EGGS)
+        .register(output -> output.accept(ModItems.MILK_DRAGON_SPAWN_EGG));
+```
+
+- `CreativeModeTabs.SPAWN_EGGS` 是 `ResourceKey<CreativeModeTab>`，**public**，直接用
+- 事件在 `CreativeModeTab.buildContents` 的 `@TAIL` 触发，
+  **对原版页签一样生效**（`alignedRight` 的那几个特殊页签会被跳过，
+  但 `SPAWN_EGGS` 不是，它没调 `alignedRight()`）
+- `FabricCreativeModeTabOutput` 除了 `accept`（追加到末尾），还有
+  `prepend` / `insertAfter(anchor, ...)` / `insertBefore(anchor, ...)`，
+  想排在某个原版刷怪蛋旁边就用 `insertAfter(Items.VILLAGER_SPAWN_EGG, ...)`
+- 同一个事件对所有页签都有：`CreativeModeTabEvents.MODIFY_OUTPUT_ALL`
+
+### 5.27 自然生成：两步走，「无视光照」用 `Mob.checkMobSpawnRules`
+
+**注册自然生成要同时做两件事，缺一不可**（见 `ModSpawns`）：
+
+```java
+// 1) 决定「站在哪儿才允许生成」
+public static <T extends Mob> void register(EntityType<T>, SpawnPlacementType,
+        Heightmap.Types, SpawnPlacements.SpawnPredicate<T>)
+
+// 2) 塞进各生物群系的刷怪表（Fabric API）
+public static void addSpawn(Predicate<BiomeSelectionContext> biomeSelector, MobCategory category,
+        EntityType<?> entityType, int weight, int minGroupSize, int maxGroupSize)
+```
+
+**⚠️ 「无视光照」的正确做法（已读字节码）** —— 光照检查在**谓词**里，不在
+`SpawnPlacementType` 里。原版两层：
+
+```java
+// net.minecraft.world.entity.Mob —— public，只有两行，完全不查光照
+public static boolean checkMobSpawnRules(EntityType<? extends Mob> type, LevelAccessor level,
+        EntitySpawnReason reason, BlockPos pos, RandomSource random) {
+    BlockPos below = pos.below();
+    return EntitySpawnReason.isSpawner(reason)
+            || level.getBlockState(below).isValidSpawn(level, below, type);
+}
+
+// net.minecraft.world.entity.monster.Monster —— 光照检查在这儿
+public static boolean checkMonsterSpawnRules(...) {
+    return (EntitySpawnReason.ignoresLightRequirements(reason)
+                || isDarkEnoughToSpawn(level, pos, random))     // ← 就是它
+            && checkMobSpawnRules(...);
+}
+```
+
+所以**想不查光照就直接指向 `Mob.checkMobSpawnRules`**（它是 public）。
+两个走不通的岔路，别再试：
+
+- `Monster.checkMonsterSpawnRules` —— 会要求黑暗，奶龙白天就不刷了
+- `Monster.checkAnyLightMonsterSpawnRules` —— 它本身确实不查光照（只是转发给
+  `checkMobSpawnRules`），但参数类型是 `EntityType<? extends Monster>`，
+  而 **`MilkDragonEntity` 继承的是 `PathfinderMob`**，类型对不上，编译不过
+
+`SpawnPlacementTypes` 只有 4 个常量：`NO_RESTRICTIONS` / `IN_WATER` / `IN_LAVA` /
+`ON_GROUND`。奶龙用 `ON_GROUND` + `Heightmap.Types.MOTION_BLOCKING_NO_LEAVES`。
+
+**⚠️「村庄检测」只能做到生物群系级。** 原版 5 个标签
+（都在 `data/minecraft/tags/worldgen/biome/has_structure/` 下）：
+
+| 标签 | 包含的生物群系 |
+|---|---|
+| `village_plains` | plains、meadow |
+| `village_desert` | desert |
+| `village_savanna` | savanna |
+| `village_snowy` | snowy_plains |
+| `village_taiga` | taiga |
+
+`BiomeTags` 里**没有**这 5 个的常量（那 86 个常量只覆盖 `is_*` 之类），
+必须自己 `TagKey.create(Registries.BIOME, Identifier.withDefaultNamespace("has_structure/village_plains"))`。
+语义是「这个生物群系里**能**生成村庄」，不是「附近真的有个村庄」——
+真正的后者要按区块查 `StructureStart`，代价大得多，而且原版刷怪本来也按生物群系走。
+
+**Fabric `addSpawn` 的两个前置断言**（读源码确认，违反直接抛异常）：
+
+- `entityType.getCategory() != MobCategory.MISC`，否则报
+  `Cannot add spawns for entities with category=MISC since they'd be replaced by pigs.`
+- 实体类型必须已注册
+
+**村庄和野外用互斥的筛选器**，否则同一个生物群系会拿到两份权重叠加：
+
+```java
+Predicate<BiomeSelectionContext> village = BiomeSelectors.foundInOverworld().and(IS_VILLAGE_BIOME);
+Predicate<BiomeSelectionContext> wild    = BiomeSelectors.foundInOverworld().and(IS_VILLAGE_BIOME.negate());
+```
+
+`BiomeSelectionContext` 上可用的判断：`getBiomeKey()` / `getBiome()` / `getBiomeHolder()` /
+`hasTag(TagKey<Biome>)` / `validForStructure(ResourceKey<Structure>)` /
+`canGenerateIn(ResourceKey<LevelStem>)` / `hasFeature(...)` / `hasPlacedFeature(...)`。
+`BiomeSelectors` 另有现成的 `foundInOverworld()` / `foundInTheNether()` /
+`foundInTheEnd()` / `tag(...)` / `includeByKey(...)` / `excludeByKey(...)` / `spawnsOneOf(...)`。
+
+### 5.28 纸片模型（厚度 0 的平面）与「剔除」渲染类型的命名陷阱
+
+> 以下全部对着 `genSources` 生成的反编译源码核实过（源码 jar 在
+> `.gradle/loom-cache/minecraftMaven/net/minecraft/minecraft-merged-*/26.3/*-sources.jar`，
+> 解压到 `build/mcsrc` 就能直接读）。
+
+#### 一次绘制只能绑一张贴图 ⇒ 正反面想用独立 PNG 就必须拆成两个渲染层
+
+这是「正反面要不要各自一个文件」这个设计问题的硬约束：
+
+- 同一个 `ModelPart` 树在一次 `submitModel` 里画完，**只绑一张贴图**
+- 所以「正面一个 PNG、背面另一个 PNG」在同一个模型里**做不到**
+- 解法：拆成两块独立的纸片，各自烘焙成独立的模型层
+  （`ModelLayerLocation` 的第二个参数是**层名字符串**，同一个 id 可以注册多层）：
+
+```java
+public static final ModelLayerLocation LAYER_FRONT =
+        new ModelLayerLocation(Mylovelymilkdragon.id("milk_dragon"), "front");
+public static final ModelLayerLocation LAYER_BACK =
+        new ModelLayerLocation(Mylovelymilkdragon.id("milk_dragon"), "back");
+```
+
+正面归渲染器本体（`context.bakeLayer(LAYER_FRONT)` 塞进 `super(...)`），
+背面挂一个渲染层（见下面「自定义渲染层」）。
+
+#### UV 是怎么落的（`ModelPart.Cube` 构造函数，第 290-322 行）
+
+```java
+float u0 = xTexOffs;
+float u1 = xTexOffs + depth;
+float u2 = xTexOffs + depth + width;
+float u3 = xTexOffs + depth + width + depth;
+float u4 = xTexOffs + depth + width + depth + width;
+float v1 = yTexOffs + depth;
+float v2 = yTexOffs + depth + height;
+// NORTH 用 (u1,v1)-(u2,v2)，SOUTH 用 (u3,v1)-(u4,v2)
+```
+
+**`depth = 0` 时**：`u1 = xTexOffs`、`u2 = xTexOffs + width`、
+`u3 = xTexOffs + width`、`u4 = xTexOffs + 2*width`。也就是——
+
+| 面 | 占贴图哪一块（`depth = 0`） |
+|---|---|
+| `NORTH` | `u ∈ [xTexOffs, xTexOffs + width]` |
+| `SOUTH` | `u ∈ [xTexOffs + width, xTexOffs + 2*width]` |
+
+而 `v ∈ [yTexOffs, yTexOffs + height]`，**v=0 在上（是头顶），没有垂直翻转**。
+
+⚠️ **想让某一个面独占整张贴图，SOUTH 必须把 texOffs 往左推 `width`。**
+因为 NORTH 天然落在 `[x, x+w]`，而 SOUTH 永远从 `x+w` 起算——
+只要 `width = 贴图宽`、`texOffs = -width`，SOUTH 就被拉回 `[0, width]` 正好铺满：
+
+```java
+createPlaneLayer(Direction.NORTH, z, 0);           // 正面：texOffs(0, 0)
+createPlaneLayer(Direction.SOUTH, z, -PLANE_SIZE); // 背面：texOffs(-32, 0)，贴图也是 32 宽
+```
+
+负数 texOffs 完全合法（源码里只是除法算 UV，没有任何校验），别被吓到。
+
+⚠️ **`depth` 一旦不为 0，`u3`/`u4` 会多偏移一个 `depth`**，上面这套算法就不成立了。
+想要厚度就拆成两个 cube，各只留一个面。本项目要的就是「零厚度的纸」，所以 `depth = 0`。
+
+⚠️ 想让「1 贴图像素 = 1 模型单位」，就把 `width` 设成模型边长、
+`LayerDefinition.create(mesh, width, height)`，这样完全不用做换算。
+
+#### 正反两面都**不镜像**（已按顶点绕序算过）
+
+- 模型空间里实体**正面 = `-z`（NORTH 方向）**（原版猪、村民的头都在负 z）
+- 渲染器里 `rotateDegrees(YP, 180 - bodyRot)` 配合 `scale(-1,-1,1)`，
+  净效果是模型 `(x,y,z) → 世界 (x,-y,-z)`
+- 于是：看正面的人，右侧 = `+x` = 模型 `maxX` = 贴图 `u` **较大**的一侧；
+  看背面的人，右侧 = `-x` = 模型 `minX` = 贴图 `u` **较大**的一侧
+- **⇒ 正反两张图都是「照平常画法画就行」，不用手动镜像**
+- 两块纸片在 z 上错开 1 个模型单位（正面 z=0、背面 z=1）：
+  背面是 SOUTH 面，方向跟正面相反，所以从任何角度都只有一块纸片
+  「正面朝着镜头」——另一块被剔除掉，压根不画
+
+#### ⚠️ 26.3 的 `entityCutout` 是**不剔背面**的那个，跟旧版命名相反
+
+```java
+// RenderPipelines.java
+public static final RenderPipeline ENTITY_CUTOUT_CULL = register(...);   // ← 默认，剔背面
+public static final RenderPipeline ENTITY_CUTOUT = register(
+        ...
+        .withCull(false)                                                 // ← 明确关掉剔除！
+        .build());
+```
+
+- `RenderTypes.entityCutout(Identifier)` → `ENTITY_CUTOUT` → **不剔背面**
+- `RenderTypes.entityCutoutCull(Identifier)` → `ENTITY_CUTOUT_CULL` → **剔背面**
+- 而 `EntityModel(ModelPart)` 的默认渲染类型就是 `RenderTypes::entityCutout`，
+  也就是说**原版实体模型默认是不剔背面的**（以前叫 `entityCutoutNoCull` 的那个）
+
+**⇒ 纸片（`depth = 0`）的正反两面共面，如果沿用默认渲染类型，两面都会画 → 转视角会闪。**
+解法是显式指定：
+
+```java
+public MilkDragonModel(ModelPart root) {
+    super(root, RenderTypes::entityCutoutCull);   // ← EntityModel(ModelPart, Function<Identifier, RenderType>)
+}
+```
+
+只用「朝着镜头的那一面」还有个附带好处：填充率减半。
+
+**绕序在剔除下确实是对的**（这点验证过，不是推测）：原版
+`ThrownTridentRenderer` 就是用同样剔背面的 `RenderTypes.entitySolidGlint(...)` 渲染
+`TridentModel` 这套 `ModelPart.Cube` 几何，显示正常。
+反过来说，**别拿 `FishingHookRenderer` 当参照**——那个用的是 `EntityRenderer` 手搓四边形，
+不是 `ModelPart.Cube`。
+
+#### 模型层的注册（Fabric）
+
+```java
+import net.fabricmc.fabric.api.client.rendering.v1.ModelLayerRegistry;
+
+ModelLayerRegistry.registerModelLayer(MyModel.LAYER, MyModel::createBodyLayer);
+
+// LAYER = new ModelLayerLocation(Mylovelymilkdragon.id("..."), "main");
+// registerModelLayer(ModelLayerLocation, TexturedLayerDefinitionProvider)
+//   TexturedLayerDefinitionProvider 是函数式接口，方法 createLayerDefinition() 返回 LayerDefinition
+```
+
+⚠️ **包名是 `fabric.api.client.rendering.v1`（`fabric-rendering-v1`）**，
+不是名字很像的 `fabric-model-loading-api-v1`——后者是**方块**模型那套，别搞混。
+
+模型骨架的构造链（都核实过）：
+
+```java
+MeshDefinition mesh = new MeshDefinition();
+PartDefinition root = mesh.getRoot();
+root.addOrReplaceChild("body",
+        CubeListBuilder.create()
+                .texOffs(0, 0)
+                .addBox(x0, y0, z0, w, h, d, Set<Direction> visibleSides),   // ← 有带 Set 的重载
+        PartPose.ZERO);
+return LayerDefinition.create(mesh, xTexSize, yTexSize);
+```
+
+- `PartPose.ZERO` 是现成常量
+- `Model.setupAnim(S)` 的默认实现**就是** `this.resetPose()`，静态模型不用覆写
+- 模型空间的坐标约定：**脚底在 `y = 24`**、头顶往负数方向长。
+  `LivingEntityRenderer` 渲染前那句 `translate(0, -1.501, 0)` 就是配合它的
+  （`24 / 16 = 1.5` 格，减 `1.501` 刚好贴地）
+
+#### 自定义渲染层（`RenderLayer`，26.3 新渲染系统）
+
+想「同一个实体、第二张贴图」就得用它。签名全部核实过：
+
+```java
+// net.minecraft.client.renderer.entity.layers.RenderLayer
+public abstract class RenderLayer<S extends EntityRenderState, M extends EntityModel<? super S>> {
+    public RenderLayer(RenderLayerParent<S, M> renderer) { ... }
+    public M getParentModel() { ... }
+    public abstract void submit(PoseStack poseStack, SubmitNodeCollector submitNodeCollector,
+            int lightCoords, S state, float yRot, float xRot);
+}
+```
+
+挂上去用 `LivingEntityRenderer.addLayer(...)`（`protected final`，在渲染器构造函数里调）：
+
+```java
+public MyRenderer(EntityRendererProvider.Context context) {
+    super(context, new MyModel(context.bakeLayer(MyModel.LAYER_MAIN)), 0.5F);
+    this.addLayer(new MyExtraLayer(this, context));   // ← this 还没构造完，但这是原版标准写法
+}
+```
+
+**关键点：`M` 只约束「父渲染器的模型类型」，层自己画什么由 `submit` 决定。**
+所以层可以 `context.bakeLayer(...)` 一个**完全不同**的 `MyModel` 实例（本项目就这么干：
+背面纸片用的是 `LAYER_BACK` 烘出来的另一个 `MilkDragonModel`）。
+
+提交几何用的是 26.3 的新渲染系统（**不是**旧的 `VertexConsumer`）：
+
+```java
+// OrderedSubmitNodeCollector —— 从 submitNodeCollector.order(n) 拿
+<S> void submitModel(Model<? super S> model, S state, PoseStack poseStack, RenderType renderType,
+        int lightCoords, int overlayCoords, int tintedColor, @Nullable UvMapping uvMapping, int outlineColor);
+
+// 便捷重载（直接传贴图，内部走 model.renderType(texture)）
+default <S> void submitModel(Model<? super S> model, S state, PoseStack poseStack, Identifier texture,
+        int lightCoords, int overlayCoords, int outlineColor);
+```
+
+```java
+submitNodeCollector.order(-1).submitModel(this.model, state, poseStack,
+        texture, lightCoords,
+        LivingEntityRenderer.getOverlayCoords(state, 0.0F),   // public static
+        state.outlineColor);
+```
+
+- `order(n)` 是绘制顺序：原版大量用 `1`（盖在本体上），
+  `SulfurCubeInnerLayer` 用 **`-1`** 表示「画在本体后面」——不透明几何其实无所谓，
+  但语义上对齐它更清楚
+- **受击红闪不用自己处理**：`LivingEntityRenderer.getOverlayCoords(state, 0.0F)`
+  里的 `state.hasRedOverlay` 就是它，原版渲染层统一传 `0.0F`
+- **隐形要自己判**：原版 `RenderLayer.coloredCutoutModelCopyLayerRender` 里就是
+  `if (!state.isInvisible) { ... }`，照抄即可
+- 渲染器里有个现成的静态辅助 `renderColoredCutoutModel(model, texture, ...)`，
+  ⚠️ 但它内部写死了 `RenderTypes.entityCutout(texture)`（**不剔背面**的那个），
+  纸片模型不能用，得自己调 `submitModel` 换渲染类型
+
+### 5.29 Goal 里追活动目标：路径**不能**每 tick 重算（会原地转圈）
+
+跟 5.17 是一家人（都是 Goal 写法），但这次踩的是 `getNavigation()`。
+
+**症状**：奶龙上台阶时会原地转一圈。用户 2026-10-02 报的。
+
+**根因**：`PathNavigation.moveTo(...)` 内部是 `createPath(...)` —— **完整的 A\* 寻路**，
+不是「设个目的地」。每 tick 调一次会同时坏三件事：
+
+```java
+// PathNavigation.moveTo(Path, double) 里，每次调用都会：
+if (!newPath.sameAs(this.path)) { this.path = newPath; }   // ← 路径换新对象，节点进度从 0 开始
+...
+this.trimPath();
+this.lastStuckCheck = this.tick;                            // ← 卡住检测基准被重置
+this.lastStuckCheckPos = mobPos;
+```
+
+1. **朝向来回甩**：路径每 tick 重建，当前节点在身子左边还是右边会来回跳；而
+   `MoveControl.tick()` 是拿当前节点算朝向的 ——
+   `float yRotD = atan2(zd, xd) * 180/PI - 90; this.mob.setYRot(rotlerp(getYRot(), yRotD, 90.0F));`
+   （每 tick 最多转 90°，且 `rotlerp` 走最短路径，本身不会转满一圈 —— **甩来自节点跳变**）。
+   上台阶正是「我站在哪一格」最模糊的时刻，所以症状在那时候最明显
+2. **卡住检测永远不触发**：`doStuckDetection` 要 `tick - lastStuckCheck > 100`，
+   每 tick 重置就永远到不了，奶龙卡住了也不会自救
+3. **白烧 CPU**：周围 16 格内有玩家/村民时，每 tick 一次 A\*
+
+**正确写法：照抄原版 `MeleeAttackGoal.tick()`**（它做的是同一件事）。它有 4 道节流：
+
+```java
+this.ticksUntilNextPathRecalculation = Math.max(this.ticksUntilNextPathRecalculation - 1, 0);
+if (... && this.ticksUntilNextPathRecalculation <= 0
+        && (this.pathedTargetX == 0.0 && this.pathedTargetY == 0.0 && this.pathedTargetZ == 0.0
+            || target.distanceToSqr(this.pathedTargetX, this.pathedTargetY, this.pathedTargetZ) >= 1.0
+            || this.mob.getRandom().nextFloat() < 0.05F)) {     // ← 4 道：没算过 / 目标动了 1 格 / 5% 兜底
+    this.pathedTargetX = target.getX();                         // ← 记下本次寻路时目标在哪
+    ...
+    this.ticksUntilNextPathRecalculation = 4 + this.mob.getRandom().nextInt(7);
+    if (!this.mob.getNavigation().moveTo(target, 0, this.speedModifier)) {
+        this.ticksUntilNextPathRecalculation += 15;             // ← 够不着就退避
+    }
+}
+```
+
+- **注意它没写 `if (cooldown > 0) return;` 就走了**，而是「冷却没到就跳过重算，
+  但本体照常跑」—— 跳过重算不代表 Goal 停了，`PathNavigation.tick()`
+  仍然会带着旧路径走。这两件事别混
+- 原版还会 `adjustedTickDelay(...)` 把 4~10 砍成 2~5（`Goal.reducedTickDelay` 是除以 2），
+  我们直接留 4~10，节流更狠一点，没有副作用
+- 本项目的落地见 `TrackNearestGoal`（`REPATH_INTERVAL_BASE` /
+  `REPATH_TARGET_MOVED_SQR` / `REPATH_REROLL_CHANCE` / `REPATH_FAIL_BONUS`）。
+  同一个包里的 `BreakTorchGoal` 从一开始就有 `REPATH_INTERVAL = 10`，
+  反而是 `TrackNearestGoal` 漏了 —— **新写追目标的 Goal 时记得照抄**
+
+**已核实**：`Entity.distanceToSqr(double, double, double)` 与
+`PathNavigation.moveTo(Entity, double)`（返回 `boolean`）/ `stop()` / `isDone()`。
+
+### 5.30 酿造配方：26.3 是**数据包 JSON**，没有 `BrewingRecipeRegistry` 了
+
+**这是本项目里唯一一个「整块功能零 Java 代码」的落地方式**（阶段 6a）。
+旧教程里的 `BrewingRecipeRegistry.registerPotionRecipe(...)` 静态注册**在 26.3 里已经不存在**，
+Fabric 也没提供对应的封装（`fabric-content-registries-v0` 里只有个 datagen 用的
+`FabricBrewingProvider`，跟运行时无关）。取而代之的是一整个 `Recipe` 类型：
+
+```
+net.minecraft.world.item.crafting.BrewingRecipe   implements Recipe<BrewingInput>
+RecipeType.BREWING                                （常量，不用自己注册）
+```
+
+原版 300+ 条酿造配方**全部**是 `data/minecraft/recipe/brewing/*.json`，
+照抄一条、改两个 id 就行。
+
+#### JSON 格式（字段名/单复数都别写错）
+
+```jsonc
+{
+  "type": "minecraft:brewing",
+  "input": {                       // ← PotionIngredient：一个 Ingredient + 可选的药水谓词
+    "item": "minecraft:potion",    //   物品（也可写 tag）
+    "potion_contents": {
+      "potions": "minecraft:awkward"    // ⚠️ 复数 potions，类型是 HolderSet<Potion>
+    }                                   //    所以单个 id / 列表 / #tag 都能写
+  },
+  "output": {
+    "components": {
+      "minecraft:potion_contents": {
+        "potion": "mylovelymilkdragon:milk_dragon"   // ⚠️ 这里【单数】potion，是个 ResourceKey
+      }
+    },
+    "id": "minecraft:potion"        // 输出物品：potion / splash_potion / lingering_potion
+  },
+  "reagent": {                      // 酿造台上格放的材料
+    "item": "mylovelymilkdragon:milk_dragon_scale"
+  }
+}
+```
+
+- 单复数已对着 codec 字节码核实：`PotionsPredicate.CODEC` 用 `optionalFieldOf("potions")`
+  （值是 `HolderSet<Potion>`），`PotionContents.FULL_CODEC` 用 `optionalFieldOf("potion")`
+- 没有 `group` / `category` / `random_sequence` 这些字段，原版表里一个都没写
+- 原版还有 `data/minecraft/tags/item/brewing_potion_inputs.json`
+  （= potion / splash_potion / lingering_potion / glass_bottle），那是给别处用的，
+  **写酿造配方时不需要碰它**
+
+#### ⚠️ 为什么不用自己注册「鳞片能不能当酿造材料」
+
+`BrewingStandBlockEntity` 在**看配方之前**会先查 `RecipePropertySet.BREWING_REAGENTS`：
+
+```java
+// canPlaceItem(slot == 3, ...)
+recipeAccess.propertySet(RecipePropertySet.BREWING_REAGENTS).test(itemStack)
+// isBrewable(...) 里也是同一句
+```
+
+不在这个集合里，鳞片**连放进酿造台上格都不行**。但**不用管它**——
+`RecipeManager.finalizeRecipeLoading()` 从一个写死的映射表里把每个
+`BrewingRecipe` 的 reagent 抽出来自动拼成这个集合：
+
+```java
+RecipePropertySet.BREWING_REAGENTS,
+recipe -> recipe instanceof BrewingRecipe r ? Optional.of(r.getReagent().ingredient()) : Optional.empty(),
+// 同理 BREWING_INPUTS 来自 r.getInput().ingredient()
+```
+
+**⇒ 写一条配方 JSON 就自动让鳞片合法了，零额外登记。**
+
+#### ⚠️ 喷溅型 / 滞留型不会自动跟着走
+
+原版是**给每一种药水单独列一条**的（`potion_water_gunpowder`、`potion_awkward_gunpowder`、
+`potion_mundane_gunpowder`……一路枚举完），并没有「任意药水 + 火药」这种通配配方。
+所以新药水只写一条的话，**做不出喷溅型**。要三形态齐全就得写三条：
+
+| 配方 | input | reagent | output.id |
+|---|---|---|---|
+| 普通 | `potion` + 粗制 | 奶龙鳞片 | `potion` |
+| 喷溅 | `potion` + 奶龙药水 | 火药 | `splash_potion` |
+| 滞留 | `splash_potion` + 奶龙药水 | 龙息 | `lingering_potion` |
+
+（滞留的前置必须是**喷溅型**，`input.item` 要跟着改。）
+
+本项目的三条落地在 `data/mylovelymilkdragon/recipe/brewing/`。
+
+#### 药水翻译键（已核实）
+
+`PotionItem.getName(ItemStack)` 的字节码是
+`PotionContents.getName(descriptionId + ".effect.")`，
+而 `PotionContents.getName(prefix)` 是 `Component.translatable(prefix + potion.name())` ——
+`Items.POTION` 的 `descriptionId` 是 `item.minecraft.potion`，
+所以键就是 **`item.minecraft.potion.effect.<Potion 构造函数的第一个参数>`**，
+**走原版命名空间**，名字不能跟原版药水重名。
+
 ## 6. 资源文件路径（已验证）
 
 ```
@@ -408,33 +1192,66 @@ src/main/resources/
 │   ├── lang/zh_cn.json          # 中文
 │   ├── icon.png                 # 已有
 │   ├── items/<物品>.json         # 物品「模型定义」，1.21.4+ 的新结构
-│   ├── models/item/<物品>.json   # 真正的模型
-│   ├── textures/item/<物品>.png  # 贴图
+│   ├── models/item/<物品>.json   # 物品的模型
+│   ├── blockstates/<方块>.json    # 方块的模型定义（变体表）
+│   ├── models/block/<方块>.json   # 方块的模型
+│   ├── textures/item/<物品>.png  # 物品贴图
+│   ├── textures/block/<方块>.png  # 方块贴图
 │   ├── sounds.json              # 音效（后期补，见第 9 节）
 │   └── textures/entity/<实体>/   # 实体贴图
 └── data/mylovelymilkdragon/
     ├── loot_table/entities/<实体>.json   # 注意是单数 loot_table
+    ├── loot_table/blocks/<方块>.json     # 方块自己被打掉时的掉落
     ├── recipe/<配方>.json               # 单数 recipe
+    ├── recipe/brewing/<酿造配方>.json    # 酿造也是 recipe，子目录只是原版的分类习惯
     ├── advancement/<进度>.json          # 单数 advancement
     └── tags/...
 ```
 
-物品 JSON 的实际格式（原版 `diamond` 的真实内容）：
+**方块要四个文件**（少任何一个方块都会变紫黑格或掉不出来）：
+`blockstates/<方块>.json` + `models/block/<方块>.json` + `items/<方块>.json`
++ `data/<ns>/loot_table/blocks/<方块>.json`。
+其中 `items/<方块>.json` 里 `"model"` 指向的是 **`block/` 下的那个模型**，不是 `item/`：
 
 ```json
-// assets/mylovelymilkdragon/items/milk.json
-{ "model": { "type": "minecraft:model", "model": "mylovelymilkdragon:item/milk" } }
-
-// assets/mylovelymilkdragon/models/item/milk.json
-{ "parent": "minecraft:item/generated",
-  "textures": { "layer0": "mylovelymilkdragon:item/milk" } }
+{ "model": { "type": "minecraft:model", "model": "mylovelymilkdragon:block/milk_dragon_egg" } }
 ```
+
+方块战利品表比实体的简单，原版龙蛋的可以照抄：
+
+```json
+{ "type": "minecraft:block",
+  "pools": [ { "rolls": 1, "entries": [ { "type": "minecraft:item", "name": "<命名空间>:<方块>" } ] } ],
+  "random_sequence": "<命名空间>:blocks/<方块>" }
+```
+
+**每个物品也要一对文件**（原版 `diamond` 的真实内容，26.3 已核实）：
+
+```json
+// assets/mylovelymilkdragon/items/milk_dragon_scale.json
+{ "model": { "type": "minecraft:model", "model": "mylovelymilkdragon:item/milk_dragon_scale" } }
+
+// assets/mylovelymilkdragon/models/item/milk_dragon_scale.json
+{ "parent": "minecraft:item/generated",
+  "textures": { "layer0": "mylovelymilkdragon:item/milk_dragon_scale" } }
+```
+
+⚠️ **少了这对 JSON，光把 PNG 丢进去是没有用的** —— 物品找不到模型，游戏里是紫黑格，
+日志会报 `Missing model`。本项目 2026-10-01 发现四个物品全都缺这对文件
+（当时只有奶蛋有），补齐后日志变成 `Missing textures in model ...`，
+那才是「只差贴图」的正确状态。
+
+⚠️ **刷怪蛋在 26.3 也是普通 `item/generated` + 单层 `layer0`**，不再是旧版的
+`item/template_spawn_egg` 双层染色模板 —— 原版 `pig_spawn_egg.png` 只有 193 字节，
+颜色直接画在贴图里。所以奶龙刷怪蛋不用写任何 tint。
 
 ### 翻译键格式（已验证，从原版 en_us.json 与字节码确认）
 
 | 类型 | 键格式 | 例子 |
 |---|---|---|
-| 物品 | `item.<命名空间>.<路径>` | `item.mylovelymilkdragon.milk` |
+| 物品 | `item.<命名空间>.<路径>` | `item.mylovelymilkdragon.milk_dragon_scale` |
+| 方块 | `block.<命名空间>.<路径>` | `block.mylovelymilkdragon.milk_dragon_egg`（靠 `useBlockDescriptionPrefix()` 自动切换前缀） |
+| 物品栏 | `itemGroup.<命名空间>.<路径>` | `itemGroup.mylovelymilkdragon.milk_dragon`（社区惯例，非原版强制） |
 | 实体 | `entity.<命名空间>.<路径>` | `entity.mylovelymilkdragon.milk_dragon` |
 | 状态效果 | `effect.<命名空间>.<路径>` | `effect.mylovelymilkdragon.dragon_breath` |
 | **药水** | **`item.minecraft.potion.effect.<Potion的名字>`** | `item.minecraft.potion.effect.dragon_breath` |
@@ -466,6 +1283,69 @@ src/main/resources/
 **收尾规矩：每轮对话改完代码，必须跑一次 `./gradlew compileJava` 并确认
 `BUILD SUCCESSFUL`，再向用户汇报。** 不要只说「改好了」而不编译。
 
+### ⚠️ `--quickPlaySingleplayer` 在本环境**不生效**（2026-10-01 实测）
+
+```
+./gradlew runClient --args='--quickPlaySingleplayer "New World (1)"'      # 无效
+./gradlew runClient --args='--quickPlaySingleplayer="New World (1)"'     # 也无效
+```
+
+两种写法都确认参数**真的进了 java 命令行**（`Get-CimInstance Win32_Process` 查过），
+但客户端仍然停在标题界面，日志里连一条 quickPlay 记录都没有。
+所以**不要指望它自动进世界**，测试时让用户手点「单人游戏 → 存档」。
+
+排查到什么程度（下次接着查的起点）：
+
+- `net.minecraft.client.main.Main` 里 `quickPlaySingleplayer` 声明是
+  **`withOptionalArg()`**，而 `quickPlayPath` / `quickPlayMultiplayer` / `quickPlayRealms`
+  都是 `withRequiredArg()` —— 只有它一个特殊
+- 执行链：`Gui.buildInitialScreens(GameLoadCookie)` 的 lambda 里判断
+  `cookie.quickPlayData().isEnabled()`，成立才调 `QuickPlay.connect(...)`，
+  否则 `setScreen(new TitleScreen(...))`。我们每次都走了 else 分支
+- `QuickPlayData.isEnabled()` 只是转发给 `variant.isEnabled()`，
+  而 `variant` 由 `Main.getQuickPlayVariant` 决定；它对三个 spec 数 `optionSet.has()` 的个数，
+  为 0 就返回 `QuickPlayVariant.DISABLED`
+- ✅ **`net.fabricmc.devlaunchinjector.Main` 已排除**（2026-10-02 读字节码核实）：
+  它把 `fabric.dli.config` 里的启动参数和原始 `args` 用 `System.arraycopy`
+  拼成一个新数组再 `astore_0` 传下去，**参数确实转发给了 MC 的 `Main`**。
+  所以要么是 `KnotClient` 环节，要么是参数本身的问题，**尚未查完**
+
+同一环境里**「能编译 ≠ 能跑」的验证靠的是**：启动客户端 → 看 `run/logs/latest.log` 里
+`[奶龙] 模组加载完成` + 无异常 + 让用户手点进世界看效果。
+
+### ⚠️ 启动期间**把窗口最小化会让客户端卡死**（2026-10-02 实测）
+
+**现象**：看着像「世界进不去」，实际是客户端整个冻住了。
+
+`run/logs/latest.log` 里的铁证（那天真发生过一次 21 分钟的卡顿）：
+
+```
+[17:35:50] Reloading ResourceManager              ← 启动的资源/数据包加载开始
+[17:35:58] SurfaceException: Cannot acquire minimized window   ← 窗口被最小化
+      （中间 21 分钟一行输出都没有）
+[17:57:13] Loaded 1866 advancements               ← 恢复窗口后这才跑完
+[17:57:17] Stopping!                              ← 用户等不及关了
+```
+
+- `SurfaceException: Cannot acquire minimized window` 这个 WARN 就是信号，
+  出在 `com.mojang.renderpearl.backend.opengl.GlSurface.acquireNextTexture`
+- 启动阶段的资源加载压在 **Render thread** 上，窗口最小化时这条线程拿不到
+  GL surface → 整个启动流程停摆，**看起来就是卡在加载界面 / 世界进不去**
+- **没有异常、没有崩溃报告、`level.dat` 也完好**，光看日志很容易误判成数据包写错
+
+**规矩**：让用户测试时**明确提醒不要最小化窗口**。
+真出现「卡住」时，先按这个清单排查，别急着怀疑自己的代码：
+
+| 检查 | 命令/位置 |
+|---|---|
+| 有没有那 21 分钟的输出空档 | `debug.log` 里找时间戳断层 |
+| 是不是真的进过世界 | `run/logs/latest.log` 找 `Starting integrated minecraft server`（**这行才是铁证**） |
+| 存档有没有被写 | `run/saves/<世界>/session.lock` 的 mtime |
+| 有没有崩溃报告 | `run/crash-reports/` |
+
+> 顺带纠正一个曾经的误解：`Loaded 1866 advancements` **不是**「进世界成功」的标志，
+> 它在**客户端启动**时也会打一次（对比 `-5`/`-6` 两份日志，结尾都是它）。
+
 ## 9. 占位策略（贴图 / 音效）
 
 美术与音频素材**由用户后期补**，代码这边先占位。两类的做法不同：
@@ -488,14 +1368,81 @@ src/main/resources/
 - `onInitialize()` 已接线，三个 `registerXxx()` 都会调用；client 入口已挂上
 - `MilkDragonEntity`：属性、三状态机、只打村民、报复、跟踪、拆火把（阶段 2 完成）
 - 渲染管线：`MilkDragonRenderer` + `MilkDragonRenderState`（阶段 3a，几何体借原版猪模型占位）
+- `ModDataComponents`：`conversion_deadline` / `next_laugh_tick` 两个持久化组件
+- `MilkDragonHeadItem`：可佩戴、绑定诅咒、每 5 秒笑、戴上满 30 秒把村民同化成奶龙
+- 战利品表：`data/mylovelymilkdragon/loot_table/entities/milk_dragon.json`
+- `milk_dragon_milk`（奶龙的奶）已注册，带原版奶桶的「清效果 + 还空桶」行为
+- `ModBlocks`：`milk_dragon_egg`（奶蛋）方块，直接复用原版 `DragonEggBlock`，
+  行为与原版龙蛋一致，方块物品一并注册
+- `ModCreativeTabs`：创造模式物品栏「奶龙」，装全部 6 件自定义物品 + 奶龙药水
+- **奶龙刷怪蛋已进原版「刷怪蛋」页签**（2026-10-02 用户反馈后补的，见 5.26 末尾）：
+  原版那个页签是硬编码的，Fabric 也不自动加，得用
+  `CreativeModeTabEvents.modifyOutputEvent(CreativeModeTabs.SPAWN_EGGS)` 自己插
+- 实机验证（2026-10-01 23:39）：`ModBlocks` / `ModCreativeTabs` 上线后启动无异常，
+  世界正常加载，1866 个进度加载成功（战利品表解析通过）
+- **物品模型文件已补齐**（2026-10-01，见第 6 节）：`milk_dragon_head` /
+  `milk_dragon_scale` / `milk_dragon_spawn_egg` / `milk_dragon_milk` 各有
+  `items/<名>.json` + `models/item/<名>.json` 一对；奶蛋另有 4 个文件。
+  实机日志已从 `Missing model` 变成 `Missing textures in model ...`（= 只差 PNG）
+- **旧的 `milk`（牛奶）已删除**（2026-10-01，用户要求）：这是阶段 0 的模板残留，
+  不在第 11 节的任何一张表里。`ModItems` 的 `MILK` 字段、创造栏里的那一项、
+  以及 `lang` 里的 `item.mylovelymilkdragon.milk` 都已移除
+- **自然生成已上线**（2026-10-02，阶段 5）：`ModSpawns` 把奶龙塞进刷怪表 ——
+  村庄生物群系权重 **15**、野外权重 5，两者互补且都走 `Mob::checkMobSpawnRules`
+  （**不看光照**）。实机验证：进世界时 Fabric 打出
+  `Applied 56 biome modifications to 56 of 67 new biomes in 5.479 ms`，
+  全程零异常、`Cannot add spawns` 断言触发 0 次。写法细节见 5.27
+- **村庄权重从 100 降到 15**（2026-10-02，用户报告「村庄里几乎没人了」之后）：
+  100 时奶龙占村庄怪物生成的 16%，叠加「无视光照」（白天独占地表刷怪）
+  就把村庄屠空了。因果链与数值表见 11.5
+- **`TrackNearestGoal` 加了重算路径节流**（2026-10-02，修「上台阶原地转圈」）：
+  之前每 tick 一次 A* 寻路，见 5.29
+- **纸片模型已上线**（2026-10-02，阶段 3b）：`MilkDragonModel` —— 两块厚度为 0 的
+  平面（正反面**各一块独立的纸片**，每块只留一个面，不再用 `PigModel`），
+  两个模型层用 Fabric 的 `ModelLayerRegistry` 注册在 `MylovelymilkdragonClient`。
+  **正面**由 `MilkDragonRenderer` 本体画，**背面**由新增的渲染层
+  `MilkDragonBackLayer` 画 —— 拆开是因为一次绘制只能绑一张贴图。
+  贴图因此是**一状态一对、共 6 张独立的 PNG**（见下方待办；渲染层 API 见 5.28，
+  里面对纸片模型的 UV 落位、`texOffs` 取负、「26.3 的 `entityCutout` 其实不剔背面」
+  这几个坑都有说明）。渲染器里 `MODEL_SCALE = 0.5F` 是唯一决定世界大小的数
+- **奶龙药水的酿造配方已上线**（2026-10-02，阶段 6a）：三条纯数据包 JSON 在
+  `data/mylovelymilkdragon/recipe/brewing/`，**零 Java 改动**（26.3 的酿造已数据驱动化，
+  见 5.30）。实机验证：用户建创造世界、摆酿造台，
+  **成功酿出奶龙药水**；日志全程无配方解析报错
+  （19:23:49 集成服务端启动 → 19:33:24 正常退出，`Failed to parse` 出现 0 次）
 
 ### 还没做的（重要）
 
-- [ ] **实体贴图一张都没有** —— 渲染器引用的两个 PNG 路径还不存在，游戏里会是紫黑格
-- [ ] 模型还是原版猪（`PigModel`），待阶段 3b 换成奶龙自己的
-- [ ] 无战利品表、无配方、无自然生成、无 `sounds.json`
+- [ ] **贴图一张都没有**（实体 6 张 + 物品 4 张 + 奶蛋 1 张）。日志里对应的
+      `Missing textures in model <路径>` 就是它们（**占位状态，不是错误**，见第 9 节）。
+      模型 JSON 全部就位，用户把 PNG 丢进 `textures/item/` 和
+      `textures/block/`、`textures/entity/milk_dragon/` 即可，不用改任何代码。
+      各物品需要的 PNG 路径见第 6 节那对 JSON 里的 `layer0`
+- [ ] **实体贴图共 6 张，每张 32 x 32**（阶段 3b 定稿，2026-10-02 用户拍板）：
+
+      | 状态 | 正面 | 背面 |
+      |---|---|---|
+      | 平静 | `milk_dragon_front.png` | `milk_dragon_back.png` |
+      | 愤怒 | `milk_dragon_angry_front.png` | `milk_dragon_angry_back.png` |
+      | 睡觉 | `milk_dragon_sleeping_front.png` | `milk_dragon_sleeping_back.png` |
+
+      全部放在 `textures/entity/milk_dragon/` 下。要点：
+      - **每张都是一整幅画，不再有「左半右半」**（旧版 64x32 方案已作废）
+      - 一张只画**一个**方向：`_front` 画「正对着奶龙看到的样子」，
+        `_back` 画「站在奶龙背后看到的样子」
+      - **两张都不用镜像**，照平常画法画即可（绕序已核对）
+      - 上方是头（v=0）、下方是脚（v=32）
+      - alpha 阈值：alpha &lt; 0.1 的像素直接丢弃，**没有半透明**；
+        想镂空就涂成完全透明
+      - **大笑没有独立贴图**，跟平静共用（只持续 2 秒，不值得多一对图）
+      - **睡觉目前只是换图，姿势不变** —— 纸片模型没有可动的骨架，
+        想做出「躺下」的感觉只能直接画进 `_sleeping` 那张图里
+      - 缺哪张只影响哪一张，游戏会显示紫黑格，不会崩
+- [ ] 音效仍是原版占位（用户决定往后放）
+- [ ] **无合成配方**（`recipe/` 下目前**只有酿造的 3 条**）、无 `sounds.json`
 - [ ] `ExampleMixin` 是模板遗留物，注入 `MinecraftServer.loadLevel`，目前没用
 - [ ] 药水内部效果仍叫「龙息」，**命名待定**（见 11.7），不阻塞开发
+- [ ] 奶龙的奶还差 11.3 里的两条效果（+5 护甲、幻听）和 Mixin 治愈僵尸村民，属阶段 6b
 - [ ] `README.md` 还是模板内容
 
 ## 11. 功能设计（定稿）
@@ -573,12 +1520,34 @@ src/main/resources/
 
 | 注册 id | 显示名 | 说明 |
 |---|---|---|
-| `milk` | 牛奶 | 已有占位 |
-| `milk_dragon_head` | 奶龙头 | **只做可佩戴物品，不做方块**（见 5.8）。`equippableUnswappable(HEAD)`；戴上有绑定诅咒；每 5 秒大笑；右键村民/灾厄村民/女巫 → 戴上 → 30 秒后**同化成奶龙** |
+| `milk_dragon_head` | 奶龙头 | **只做可佩戴物品，不做方块**（见 5.8）。`equippableUnswappable(HEAD)`；戴上有绑定诅咒；每 5 秒大笑；右键村民/灾厄村民/女巫 → 戴上 → 30 秒后**同化成奶龙**（实现见下方备注） |
 | `milk_dragon_scale` | 奶龙鳞片 | 酿造原料 |
 | `milk_dragon_spawn_egg` | 奶龙刷怪蛋 | |
 | `milk_dragon_milk` | **奶龙的奶** | 详见 11.3 |
+| `milk_dragon_egg` | 奶蛋 | **是方块，不是普通物品**，见 11.4。注册在 `ModBlocks` 里 |
 | （原版 `minecraft:sulfur`） | 硫磺 | **直接用原版物品**，不自己注册 |
+
+> ~~`milk`（牛奶）~~ **已于 2026-10-01 删除**。它是阶段 0 搭骨架时的遗留占位：
+> 一个空壳 `Item`，非食物、不能喝、没有任何行为，全代码库无一处引用，
+> 需求文档里也只有「已有占位」四个字。**别把它和 `milk_dragon_milk`（奶龙的奶）搞混**——
+> 后者是真正有设计的物品（见 11.3）。
+
+**奶龙头的实现备注**（`io.github.ninetwo.mdragon.item.MilkDragonHeadItem`）：
+
+- **不需要 Mixin，也不需要碰村民的 `mobInteract`。** 「右键给生物戴帽子」是原版行为，
+  由 `Equippable.setEquipOnInteract(true)` 打开，而且它在打开村民交易界面**之前**执行，
+  详见 5.21。这跟 5.7 的「治愈僵尸村民必须 Mixin」是两回事，别混
+- 「戴上之后」的两件事（30 秒同化、每 5 秒笑）全挂在 `Item.inventoryTick` 上，
+  因为任何生物戴着它都会被每 tick 调到，详见 5.20
+- 能戴 = 会被同化的名单写在 `MilkDragonHeadItem.ALLOWED_WEARERS`，
+  **必须包含 `EntityTypes.PLAYER`**（否则玩家自己戴不上），详见 5.21。
+  另一半 `isConvertible()` 是 `Villager` / `AbstractIllager` / `Witch`，
+  **改一边就要同步改另一边**
+- **流浪商人（`WanderingTrader`）不在名单里** —— 11.2 写的是「村民」，按字面取 `Villager`
+- **头是同化的消耗品**，变身时会被删掉（`MilkDragonHeadItem` 里摘掉 HEAD 槽那行）。
+  想改成「变完把头吐出来」的话，把那行换成往 `level` 里 `addFreshEntity` 一个掉落物
+- 同化用 `Mob.convertTo`（`ConversionParams.single(mob, false, false)` +
+  `EntitySpawnReason.CONVERSION`），见 5.11
 
 ### 11.3 奶龙的奶（`milk_dragon_milk`）
 
@@ -601,11 +1570,55 @@ src/main/resources/
 固定掉落：**奶龙的奶**、**硫磺**、**奶蛋** ｜ **15%** 掉附魔金苹果 ｜
 兼容抢夺附魔 ｜ **爆炸死亡时额外掉奶龙头**
 
+**已落地**（`data/mylovelymilkdragon/loot_table/entities/milk_dragon.json`）：
+
+| 掉落 | 数量 | 抢夺加成 | 备注 |
+|---|---|---|---|
+| 奶龙的奶 | 1 | +0~1 | |
+| 硫磺 `minecraft:sulfur` | 1~2 | +0~1 | 用原版物品，不自己注册 |
+| 奶龙鳞片 | 1 | +0~1 | **用户 2026-10-01 补的**：原稿漏了它，而 11.6 的酿造配方要用 |
+| **奶蛋** | 1 | 无 | **每次击杀都掉**（用户 2026-10-01 拍板）。是**方块**，见下方 |
+| 附魔金苹果 | 1 | 15% → 每级 +1% | 单独的池 |
+| 奶龙头 | 1 | 无 | **只在爆炸死亡时掉**，条件是伤害来源带 `minecraft:is_explosion` 标签 |
+
+**上述数量/概率是 AI 按常理填的占位值**（原设计只写了「固定掉落」「15%」，没写几个），
+想调直接改那个 JSON。表里的条件/修饰符写法见 5.23。
+
+#### 奶蛋（`milk_dragon_egg`）
+
+**用户 2026-10-01 定稿：定位是「像原版龙蛋那样的战利品」，但每次击杀都掉。**
+
+这两个特征原本是矛盾的（原版龙蛋全存档只掉一个），用户明确选了「每次击杀都掉」，
+所以**不需要**做存档级的状态标记。后续模组 2.0 可能把它加进合成配方。
+
+- 是**方块**，行为照抄原版龙蛋：能放地上、受重力会掉、被打会瞬移。
+  实现方式是直接复用原版 `DragonEggBlock`（构造函数是 public），一行逻辑都没抄
+- 注册在 `ModBlocks`（**不是 `ModItems`**），方块物品由 `ModBlocks.registerWithItem` 一并注册
+- 方块属性照抄原版龙蛋，只有 `mapColor` 换成 `MapColor.SNOW`（白色，配奶龙主题；
+  原版龙蛋是黑的）。**这一处是 AI 自作主张的，用户没指定**
+- 方块自己被打掉时的掉落表是 `data/mylovelymilkdragon/loot_table/blocks/milk_dragon_egg.json`
+
 ### 11.5 自然生成
 
 - **村庄**：高概率，**无视光照**
 - **野外**：低概率（权重视情况调高），**无视光照**
 - ⚠️ 「检测附近村庄」这套逻辑**尚未验证可行性**，最坏退化成「野外也生成」
+
+**权重的实际取值（2026-10-02 据实机反馈定稿）：**
+
+| | 权重 | 说明 |
+|---|---|---|
+| 村庄 | **15** | 原版 plains 的 MONSTER 总权重是 515（蜘蛛/骷髅/苦力怕/史莱姆各 100、僵尸 90…），15 ≈「12 只原版怪里混 1 只奶龙」 |
+| 野外 | **5** | 约 1% |
+
+> ⚠️ **村庄权重曾试过 100，被实测否掉了。** 100 = 16% 的怪物都是奶龙，
+> 再叠上「无视光照」（白天原版地表怪一只都刷不出来，奶龙照刷），
+> 等于**独占了白天的刷怪机会**；而它唯一的目标就是村民，150 血 / 护甲 15 /
+> 击退抗性 1.0 又让铁傀儡很难翻盘 —— 结果就是**村庄被屠到几乎没人**。
+> 想再调高请先想清楚这一串因果。
+>
+> 数值都是按常理填的占位值（原设计只写了「高概率」「低概率」），
+> 改直接改 `ModSpawns` 顶部那两个常量。
 
 ### 11.6 药水
 
@@ -622,6 +1635,18 @@ src/main/resources/
 药水**本身**的名字已定稿（奶龙药水），只是它内部那个**状态效果**的名字还没想好，
 先按旧名跑着，不阻塞任何开发。
 
+**配方已落地**（阶段 6a，2026-10-02）—— 三条纯数据包 JSON，在
+`data/mylovelymilkdragon/recipe/brewing/`，**一行 Java 都没加**（原因见 5.30）：
+
+| 形态 | 基础 | 材料 | 文件 |
+|---|---|---|---|
+| 普通（可饮用） | 粗制的药水 | 奶龙鳞片 | `potion_awkward_milk_dragon_scale.json` |
+| 喷溅型 | 奶龙药水 | 火药 | `potion_milk_dragon_gunpowder.json` |
+| 滞留型 | **喷溅型**奶龙药水 | 龙息 | `splash_potion_milk_dragon_dragon_breath.json` |
+
+> 后两条是 **2026-10-02 用户拍板加的**：11.6 原文只写了第一条，而原版是**每种药水
+> 单独列一条**、没有通配配方，不写就没有喷溅/滞留形态。用户选了「跟原版药水行为对齐」。
+
 ### 11.7 待定 / 已放弃 / 预留
 
 > **待定**项：用户还没想好，先不定。**不要为了填坑而自由发挥**——
@@ -630,7 +1655,8 @@ src/main/resources/
 | 项 | 状态 |
 |---|---|
 | 药水内部**效果**的 id 与显示名 | 🟡 **待定**（暂沿用 `dragon_breath`／「龙息」） |
-| 召唤事件（指令 / 奶蛋触发，可飞行的奶龙） | 🟡 **待定**，暂不做 |
+| ~~**奶蛋**是什么~~ | ✅ **已定稿**（2026-10-01）：像原版龙蛋那样的方块战利品，每次击杀都掉。见 11.4 |
+| 召唤事件（指令 / 奶蛋触发，可飞行的奶龙） | 🟡 **待定**，暂不做。奶蛋现已落地，将来做事件时可以直接拿它当触发物 |
 | 奶龙祭坛（结构） | 🟡 **待定**，暂不做 |
 | 头颅做成方块 | ❌ **放弃**（见 5.8，泥潭；原版三种头颅走同一段硬编码） |
 | 视野变黄 | ❌ **放弃**（见 5.9，无扩展点；用户同意不做） |
@@ -643,10 +1669,10 @@ src/main/resources/
 | **1** | 实体骨架：属性表、MONSTER 类别、`fireImmune`、同步状态定义 | ✅ 已完成 |
 | **2** | AI 与行为：三状态、跟踪/攻击目标、报复、打火把、随机睡觉、愤怒改移速 | ✅ 已完成 |
 | **3a** | 渲染管线：RenderState + Renderer 注册（几何体借原版猪模型占位） | ✅ 已完成 |
-| **3b** | 自定义奶龙模型 + 平时/愤怒两套贴图 | ⬜ |
-| **4** | 掉落 + 奶龙头（可佩戴物品）：战利品表、头物品、`convertTo` 同化村民 | ⬜ |
-| **5** | 自然生成：村庄高概率 + 野外低概率，均无视光照 | ⬜ |
-| **6a** | 奶龙药水 + 酿造配方 | ⬜ |
+| **3b** | 自定义奶龙模型 + 平时/愤怒/睡觉 三套贴图 | ✅ 已完成（2026-10-02，纸片模型，正背各一张共 6 图，见 5.28） |
+| **4** | 掉落 + 奶龙头（可佩戴物品）：战利品表、头物品、`convertTo` 同化村民 | ✅ 已完成 |
+| **5** | 自然生成：村庄高概率 + 野外低概率，均无视光照 | ✅ 已完成（2026-10-02，见 5.27） |
+| **6a** | 奶龙药水 + 酿造配方 | ✅ 已完成（2026-10-02，纯数据包 JSON，零 Java 改动，见 5.30） |
 | **6b** | 奶龙的奶的饮用效果：+5 护甲、幻听、喂奶龙消怒、Mixin 治愈僵尸村民 | ⬜ |
 | **7** | 预留：召唤事件 + 奶龙祭坛 | ⬜ |
 
