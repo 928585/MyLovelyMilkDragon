@@ -1,5 +1,6 @@
 package io.github.ninetwo.mdragon;
 
+import java.util.List;
 import java.util.function.Function;
 
 import io.github.ninetwo.mdragon.item.MilkDragonHeadItem;
@@ -10,11 +11,15 @@ import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.core.registries.Registries;
 import net.minecraft.resources.ResourceKey;
 import net.minecraft.sounds.SoundEvents;
+import net.minecraft.world.effect.MobEffectInstance;
 import net.minecraft.world.entity.EquipmentSlot;
 import net.minecraft.world.item.Item;
 import net.minecraft.world.item.Items;
 import net.minecraft.world.item.SpawnEggItem;
+import net.minecraft.world.item.component.Consumable;
 import net.minecraft.world.item.component.Consumables;
+import net.minecraft.world.item.consume_effects.ApplyStatusEffectsConsumeEffect;
+import net.minecraft.world.item.consume_effects.ClearAllStatusEffectsConsumeEffect;
 import net.minecraft.world.item.enchantment.Enchantments;
 import net.minecraft.world.item.enchantment.ItemEnchantments;
 import net.minecraft.world.item.equipment.Equippable;
@@ -34,15 +39,48 @@ public class ModItems {
 
     // 4. 奶龙的奶
     //
-    // 属性直接照抄原版奶桶（从 Items 静态初始化字节码里挖出来的），所以「清空所有状态效果 +
-    // 喝完返还空桶」这两条现在就已经生效了。
-    // 11.3 里剩下的两条（+5 护甲、幻听）属于阶段 6b，要另外注册自定义 MobEffect 再挂上来。
+    // 桶的部分直接照抄原版奶桶（从 Items 静态初始化字节码里挖出来的），
+    // 饮用效果的 4 条里有 3 条落在 milkConsumable() 里，第 4 条（治愈僵尸村民）
+    // 是 ZombieVillagerMixin 的事。喂奶龙消怒在 MilkDragonEntity.mobInteract。
     public static final Item MILK_DRAGON_MILK = register("milk_dragon_milk",
             properties -> new Item(properties
-                    .craftRemainder(Items.BUCKET)                                 // 喝完留空桶
-                    .component(DataComponents.CONSUMABLE, Consumables.MILK_BUCKET) // 清除所有状态效果
+                    .craftRemainder(Items.BUCKET)                            // 喝完留空桶
+                    .component(DataComponents.CONSUMABLE, milkConsumable())  // 清效果 + 护甲 + 幻听
                     .usingConvertsTo(Items.BUCKET)
                     .stacksTo(1)));
+
+    /** 喝下后「+5 护甲」持续多久：3 分钟，跟奶龙药水对齐。占位值，想调改这里。 */
+    private static final int MILK_ARMOR_DURATION_TICKS = 20 * 180;
+
+    /** 喝下后「幻听」持续多久：1 分钟。占位值，想调改这里。 */
+    private static final int MILK_HALLUCINATION_DURATION_TICKS = 20 * 60;
+
+    /**
+     * 「奶龙的奶」的饮用效果（CLAUDE.md 11.3 的前三条）。
+     *
+     * <p>原版奶桶其实就是 {@code Consumables.MILK_BUCKET = defaultDrink()
+     * .onConsume(ClearAllStatusEffectsConsumeEffect.INSTANCE).build()}，
+     * 这里把它拆开，在中间再插一条加效果的。
+     *
+     * <p>⚠️ <b>顺序不能反。</b>{@code Consumable.onConsume} 收进的是一个 List，
+     * 饮用时按加入顺序逐个执行（{@code onConsumeEffects.forEach(...)}）。
+     * 先加效果再清效果的话，刚挂上去的护甲和幻听会被自己清掉。
+     *
+     * <p>另外 {@code MobEffectInstance} 的等级传 0（= I 级），护甲修饰符是固定 +5，
+     * 不随等级走；喝第二瓶只会刷新时长，不会叠成 +10。
+     */
+    private static Consumable milkConsumable() {
+        // ② +5 护甲、③ 幻听，两个一起加
+        List<MobEffectInstance> effects = List.of(
+                new MobEffectInstance(ModEffects.MILK_DRAGON_ARMOR,
+                        MILK_ARMOR_DURATION_TICKS, 0),
+                new MobEffectInstance(ModEffects.MILK_DRAGON_HALLUCINATION,
+                        MILK_HALLUCINATION_DURATION_TICKS, 0));
+        return Consumables.defaultDrink()                                 // 1.6 秒、DRINK 动作、无粒子
+                .onConsume(ClearAllStatusEffectsConsumeEffect.INSTANCE)    // ① 原版牛奶：清掉所有效果
+                .onConsume(new ApplyStatusEffectsConsumeEffect(effects))   // ②③ 再挂上去
+                .build();
+    }
 
     /**
      * 奶龙头的佩戴信息。

@@ -6,6 +6,8 @@
   "block.mylovelymilkdragon.milk_dragon_egg": "Milk Dragon Egg",
   "entity.mylovelymilkdragon.milk_dragon": "Milk Dragon",
   "effect.mylovelymilkdragon.dragon_breath": "Dragon Breath",
+  "effect.mylovelymilkdragon.milk_dragon_armor": "Milk Dragon's Protection",
+  "effect.mylovelymilkdragon.milk_dragon_hallucination": "Hallucination",
   "item.minecraft.potion.effect.milk_dragon": "Potion of Milk Dragon",
   "itemGroup.mylovelymilkdragon.milk_dragon": "Milk Dragon"
 }

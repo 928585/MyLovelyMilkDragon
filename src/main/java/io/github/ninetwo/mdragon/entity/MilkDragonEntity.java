@@ -1,6 +1,7 @@
 package io.github.ninetwo.mdragon.entity;
 
 import io.github.ninetwo.mdragon.ModEntities;
+import io.github.ninetwo.mdragon.ModItems;
 import io.github.ninetwo.mdragon.Mylovelymilkdragon;
 import io.github.ninetwo.mdragon.entity.goal.BreakTorchGoal;
 import io.github.ninetwo.mdragon.entity.goal.TrackNearestGoal;
@@ -12,6 +13,8 @@ import net.minecraft.resources.Identifier;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.sounds.SoundEvent;
 import net.minecraft.sounds.SoundEvents;
+import net.minecraft.world.InteractionHand;
+import net.minecraft.world.InteractionResult;
 import net.minecraft.world.damagesource.DamageSource;
 import net.minecraft.world.entity.EntityType;
 import net.minecraft.world.entity.PathfinderMob;
@@ -28,6 +31,7 @@ import net.minecraft.world.entity.ai.goal.target.HurtByTargetGoal;
 import net.minecraft.world.entity.ai.goal.target.NearestAttackableTargetGoal;
 import net.minecraft.world.entity.npc.villager.Villager;
 import net.minecraft.world.entity.player.Player;
+import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.storage.ValueInput;
@@ -386,7 +390,45 @@ public class MilkDragonEntity extends PathfinderMob {
                 new NearestAttackableTargetGoal<>(this, Villager.class, true));
     }
 
-    // ---- 11. 工具方法 ----
+    // ---- 11. 交互 ----
+    /**
+     * 喂「奶龙的奶」：把它从愤怒里拉回来（CLAUDE.md 11.3「其他用途」）。
+     *
+     * <p>三个细节都不是随手写的：
+     * <ul>
+     *   <li><b>光调 {@link #setAngry(boolean)} 不够，还得清目标。</b>
+     *       它只管愤怒状态和移速，而真正驱动「谁打我我打谁」的是 {@code targetSelector}
+     *       里的 {@code HurtByTargetGoal}，那条线跟 {@code isAngry} 毫无关系。
+     *       只清愤怒的话会出现「看着已经平静、贴图也换回来了，但还在追着你打」的怪状态。
+     *       所以这里连目标、寻路、以及「记住是谁打的」一起清掉。</li>
+     *   <li><b>用 {@link #usePlayerItem} 而不是 {@code stack.consume(1, player)}。</b>
+     *       前者会走 {@code USE_REMAINDER} 组件（就是 {@code usingConvertsTo} 登记的空桶），
+     *       和玩家自己喝下去一样把桶还给他。</li>
+     *   <li><b>返回 {@code SUCCESS_SERVER}。</b>跟原版 {@code ZombieVillager} 治愈时一个思路：
+     *       服务端才是权威，客户端不做预测。它的 {@code consumesAction()} 为 true，
+     *       所以玩家不会顺手把这桶奶喝掉。</li>
+     * </ul>
+     *
+     * <p>不生气的时候直接交还给 {@code super}（也就是 {@code PASS}），
+     * 这时玩家会照常把奶喝掉——跟右键其它生物没什么两样。
+     */
+    @Override
+    protected InteractionResult mobInteract(Player player, InteractionHand hand) {
+        ItemStack stack = player.getItemInHand(hand);
+        if (!stack.is(ModItems.MILK_DRAGON_MILK) || !this.isAngry()) {
+            return super.mobInteract(player, hand);
+        }
+        if (this.level() instanceof ServerLevel) {
+            this.usePlayerItem(player, hand, stack);
+            this.setAngry(false);
+            this.setTarget(null);
+            this.setLastHurtByMob(null);
+            this.getNavigation().stop();
+        }
+        return InteractionResult.SUCCESS_SERVER;
+    }
+
+    // ---- 12. 工具方法 ----
     /** 在 [min, max] 闭区间里取一个随机 tick 数。 */
     private int randomBetween(int min, int max) {
         return min + this.random.nextInt(max - min + 1);
@@ -400,7 +442,7 @@ public class MilkDragonEntity extends PathfinderMob {
         return this.randomBetween(SLEEP_INTERVAL_MIN_TICKS, SLEEP_INTERVAL_MAX_TICKS);
     }
 
-    // ---- 12. 声音 ----
+    // ---- 13. 声音 ----
     // 阶段 2 先拿原版音效占位（愤怒 = 劫掠兽吼，大笑 = 村民欢呼）；
     // 素材到位后改成自定义 SoundEvent，见 CLAUDE.md 第 9 节。
     // TODO(阶段3b): 换成 mylovelymilkdragon:milk_dragon.roar / .laugh
@@ -419,7 +461,7 @@ public class MilkDragonEntity extends PathfinderMob {
         this.playSound(SoundEvents.IRON_GOLEM_STEP, 0.15F, 1.0F);
     }
 
-    // ---- 13. 掉落 ----
+    // ---- 14. 掉落 ----
     // 完全由战利品表控制，不需要覆写方法：
     //   src/main/resources/data/mylovelymilkdragon/loot_table/entities/milk_dragon.json
     // （阶段 4）

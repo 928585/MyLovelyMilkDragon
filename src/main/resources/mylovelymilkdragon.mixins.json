@@ -3,7 +3,8 @@
 	"package": "io.github.ninetwo.mdragon.mixin",
 	"compatibilityLevel": "JAVA_25",
 	"mixins": [
-		"ExampleMixin"
+		"ExampleMixin",
+		"ZombieVillagerMixin"
 	],
 	"injectors": {
 		"defaultRequire": 1
