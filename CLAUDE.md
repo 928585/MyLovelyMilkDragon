@@ -1402,7 +1402,7 @@ src/main/resources/
 | 方块 | `block.<命名空间>.<路径>` | `block.mylovelymilkdragon.milk_dragon_egg`（靠 `useBlockDescriptionPrefix()` 自动切换前缀） |
 | 物品栏 | `itemGroup.<命名空间>.<路径>` | `itemGroup.mylovelymilkdragon.milk_dragon`（社区惯例，非原版强制） |
 | 实体 | `entity.<命名空间>.<路径>` | `entity.mylovelymilkdragon.milk_dragon` |
-| 状态效果 | `effect.<命名空间>.<路径>` | `effect.mylovelymilkdragon.dragon_breath` |
+| 状态效果 | `effect.<命名空间>.<路径>` | `effect.mylovelymilkdragon.milk_dragon_qi` |
 | **药水** | **`item.minecraft.potion.effect.<Potion的名字>`** | `item.minecraft.potion.effect.dragon_breath` |
 
 ⚠️ 药水的翻译键走的是**原版命名空间**（由 `PotionItem` 的 `descriptionId + ".effect."`
@@ -1588,6 +1588,13 @@ powershell -NoProfile -Command "Stop-Process -Id <PID> -Force"
     `-Dmixin.debug.export=true` 导出改写后的 `ZombieVillager.class`，
     javap 确认 handler 已插在 `ItemStack.is(Object)` 那一条上（判断注入是否
     成功的方法见 5.31）
+- **阶段 6b 已由用户实机逐个测过**（2026-10-02）：四条饮用效果、喂奶消怒、
+  治愈僵尸村民全部确认可用，无问题
+- **药水内部效果定名「奶龙之气」**（2026-10-02，用户拍板）：注册 id 从阶段 0/1 的
+  旧占位 `dragon_breath` 改为 **`milk_dragon_qi`**（旧 id 还跟原版物品
+  `minecraft:dragon_breath` 撞名），Java 字段 → `MILK_DRAGON_QI_EFFECT`，
+  两个 lang 文件同步。⚠️ 它目前仍是**空壳效果** —— 只显示一个图标，
+  喝了没有任何实际作用，行为还没定，见 11.6
 - **模板遗留物已清掉 + README 重写**（2026-10-02）：删除了 `ExampleMixin`
   （注入 `MinecraftServer.loadLevel`，从未启用过）以及 `mylovelymilkdragon.mixins.json`
   里对应的那一项；`README.md` 从 Fabric 模板的「Setup / License」两段换成了模组本身的
@@ -1622,7 +1629,8 @@ powershell -NoProfile -Command "Stop-Process -Id <PID> -Force"
       - 缺哪张只影响哪一张，游戏会显示紫黑格，不会崩
 - [ ] 音效仍是原版占位（用户决定往后放）
 - [ ] **无合成配方**（`recipe/` 下目前**只有酿造的 3 条**）、无 `sounds.json`
-- [ ] 药水内部效果仍叫「龙息」，**命名待定**（见 11.7），不阻塞开发
+- [ ] **奶龙之气目前是空壳效果**（只显示图标，没有任何实际作用）。11.6 只定了名字、
+      没写它该做什么，所以没有自行发挥 —— 行为等用户明确后再加
 - [ ] 幻听的音效池（8 个原版音效）、间隔（5 秒）、两个效果的时长（护甲 3 分钟 / 幻听 1 分钟）
       都是**占位值**，原设计没写数，都在 `HallucinationEffect` 和 `ModItems.milkConsumable()`
       顶部改。幻听用的是原版音效占位，等自定义音效到位后按第 9 节的流程换
@@ -1812,10 +1820,14 @@ powershell -NoProfile -Command "Stop-Process -Id <PID> -Force"
 | 药水翻译键 | `item.minecraft.potion.effect.milk_dragon` |
 | 显示名 | 奶龙药水 / Potion of Milk Dragon |
 | 酿造配方 | 粗制的药水 + 奶龙鳞片 → 奶龙药水（阶段 6a 实现） |
-| 内部效果 | 暂沿用旧的 `effect.mylovelymilkdragon.dragon_breath`（「龙息」），**命名待定**，见 11.7 |
+| 内部效果 | **奶龙之气**（注册 id `mylovelymilkdragon:milk_dragon_qi`），2026-10-02 定稿 |
 
-药水**本身**的名字已定稿（奶龙药水），只是它内部那个**状态效果**的名字还没想好，
-先按旧名跑着，不阻塞任何开发。
+药水和它内部效果的名字**都**已定稿（奶龙药水 / 奶龙之气）。
+
+⚠️ **但「奶龙之气」该做什么，原设计里没写。** 当前实现是个**空壳效果**：
+`ModPotions` 里只有 `new MobEffect(...) {}`，喝下去只会多一个图标，
+没有任何实际作用（这正是 5.4 警告的那种情况）。**没有自行发挥去补行为** ——
+想让它有实际效果（加属性、定时做点什么……），先说清楚要什么。
 
 **配方已落地**（阶段 6a，2026-10-02）—— 三条纯数据包 JSON，在
 `data/mylovelymilkdragon/recipe/brewing/`，**一行 Java 都没加**（原因见 5.30）：
@@ -1836,7 +1848,8 @@ powershell -NoProfile -Command "Stop-Process -Id <PID> -Force"
 
 | 项 | 状态 |
 |---|---|
-| 药水内部**效果**的 id 与显示名 | 🟡 **待定**（暂沿用 `dragon_breath`／「龙息」） |
+| ~~药水内部**效果**的 id 与显示名~~ | ✅ **已定稿**（2026-10-02）：**奶龙之气**，id `milk_dragon_qi`。见 11.6 |
+| **奶龙之气**具体做什么 | 🟡 **待定**，目前是空壳效果，见 11.6 |
 | ~~**奶蛋**是什么~~ | ✅ **已定稿**（2026-10-01）：像原版龙蛋那样的方块战利品，每次击杀都掉。见 11.4 |
 | 召唤事件（指令 / 奶蛋触发，可飞行的奶龙） | 🟡 **待定**，暂不做。奶蛋现已落地，将来做事件时可以直接拿它当触发物 |
 | 奶龙祭坛（结构） | 🟡 **待定**，暂不做 |
