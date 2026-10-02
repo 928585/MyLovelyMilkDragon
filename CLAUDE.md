@@ -1413,8 +1413,8 @@ src/main/resources/
 - 新注册类要在 `Mylovelymilkdragon.onInitialize()` 里调用它的 `registerXxx()`
 
 排版：VS Code 里装了 Checkstyle，会按 **4 空格缩进 / 行宽 100 / 禁用 tab** 报警告。
-新写的代码按 4 空格写。`ExampleMixin.java` 还是模板的 tab 版，会一直报
-`FileTabCharacterCheck`，**这只是警告，不影响编译**（该文件目前仍是模板遗留物）。
+新写的代码按 4 空格写。模板遗留的 `ExampleMixin` 已于 2026-10-02 删除，
+现在 `mixin` 包下只有 `ZombieVillagerMixin`，不再有 tab 报警告。
 
 ## 8. 常用命令
 
@@ -1568,6 +1568,10 @@ src/main/resources/
     `-Dmixin.debug.export=true` 导出改写后的 `ZombieVillager.class`，
     javap 确认 handler 已插在 `ItemStack.is(Object)` 那一条上（判断注入是否
     成功的方法见 5.31）
+- **模板遗留物已清掉 + README 重写**（2026-10-02）：删除了 `ExampleMixin`
+  （注入 `MinecraftServer.loadLevel`，从未启用过）以及 `mylovelymilkdragon.mixins.json`
+  里对应的那一项；`README.md` 从 Fabric 模板的「Setup / License」两段换成了模组本身的
+  说明（需求、版本要求、内容一览、构建、开发状态）。见第 7 节
 
 ### 还没做的（重要）
 
@@ -1598,12 +1602,10 @@ src/main/resources/
       - 缺哪张只影响哪一张，游戏会显示紫黑格，不会崩
 - [ ] 音效仍是原版占位（用户决定往后放）
 - [ ] **无合成配方**（`recipe/` 下目前**只有酿造的 3 条**）、无 `sounds.json`
-- [ ] `ExampleMixin` 是模板遗留物，注入 `MinecraftServer.loadLevel`，目前没用
 - [ ] 药水内部效果仍叫「龙息」，**命名待定**（见 11.7），不阻塞开发
 - [ ] 幻听的音效池（8 个原版音效）、间隔（5 秒）、两个效果的时长（护甲 3 分钟 / 幻听 1 分钟）
       都是**占位值**，原设计没写数，都在 `HallucinationEffect` 和 `ModItems.milkConsumable()`
       顶部改。幻听用的是原版音效占位，等自定义音效到位后按第 9 节的流程换
-- [ ] `README.md` 还是模板内容
 
 ## 11. 功能设计（定稿）
 
