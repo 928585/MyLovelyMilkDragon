@@ -1,9 +1,11 @@
 {
-  "item.mylovelymilkdragon.milk": "牛奶",
   "item.mylovelymilkdragon.milk_dragon_head": "奶龙头",
   "item.mylovelymilkdragon.milk_dragon_scale": "奶龙鳞片",
   "item.mylovelymilkdragon.milk_dragon_spawn_egg": "奶龙刷怪蛋",
+  "item.mylovelymilkdragon.milk_dragon_milk": "奶龙的奶",
+  "block.mylovelymilkdragon.milk_dragon_egg": "奶蛋",
   "entity.mylovelymilkdragon.milk_dragon": "奶龙",
   "effect.mylovelymilkdragon.dragon_breath": "龙息",
-  "item.minecraft.potion.effect.milk_dragon": "奶龙药水"
+  "item.minecraft.potion.effect.milk_dragon": "奶龙药水",
+  "itemGroup.mylovelymilkdragon.milk_dragon": "奶龙"
 }

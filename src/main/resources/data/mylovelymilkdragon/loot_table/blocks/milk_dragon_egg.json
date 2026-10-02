@@ -1,0 +1,15 @@
+{
+  "type": "minecraft:block",
+  "pools": [
+    {
+      "entries": [
+        {
+          "type": "minecraft:item",
+          "name": "mylovelymilkdragon:milk_dragon_egg"
+        }
+      ],
+      "rolls": 1
+    }
+  ],
+  "random_sequence": "mylovelymilkdragon:blocks/milk_dragon_egg"
+}
