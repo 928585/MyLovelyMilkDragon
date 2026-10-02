@@ -1181,6 +1181,151 @@ recipe -> recipe instanceof BrewingRecipe r ? Optional.of(r.getReagent().ingredi
 所以键就是 **`item.minecraft.potion.effect.<Potion 构造函数的第一个参数>`**，
 **走原版命名空间**，名字不能跟原版药水重名。
 
+### 5.31 状态效果 / 消耗效果 / Mixin 注入（阶段 6b 核实）
+
+#### `Consumable.onConsume` 是**有序列表**，谁先谁后决定成败
+
+```java
+// Consumable.Builder：攒进一个 List
+private final List<ConsumeEffect> onConsumeEffects = new ArrayList<>();
+public Consumable.Builder onConsume(ConsumeEffect effect) { this.onConsumeEffects.add(effect); ... }
+
+// Consumable.onConsume(...) 真正执行时：按加入顺序逐个跑
+this.onConsumeEffects.forEach(action -> action.apply(level, stack, user));
+```
+
+原版奶桶的真身就一句：
+
+```java
+public static final Consumable MILK_BUCKET =
+        defaultDrink().onConsume(ClearAllStatusEffectsConsumeEffect.INSTANCE).build();
+// defaultDrink() = consumeSeconds(1.6F).animation(DRINK).sound(GENERIC_DRINK).hasConsumeParticles(false)
+```
+
+⚠️ **「清空所有效果」必须排在「挂上新效果」前面**，反过来的话刚加上的会被自己清掉。
+
+`ApplyStatusEffectsConsumeEffect` 三个构造函数（不带 probability 的默认 1.0）：
+
+```java
+new ApplyStatusEffectsConsumeEffect(MobEffectInstance effect)
+new ApplyStatusEffectsConsumeEffect(MobEffectInstance effect, float probability)
+new ApplyStatusEffectsConsumeEffect(List<MobEffectInstance> effects)
+```
+
+- 它内部会**复制**一遍再 `addEffect(new MobEffectInstance(effect))`，不是直接用你传进去的对象
+
+#### ⚠️ `ItemStack` 上有**两个** `is`，字节码描述符不一样（写 Mixin 必须知道）
+
+| 声明处 | 源码形态 | 擦除后的描述符 |
+|---|---|---|
+| `ItemStack` 自己 | `is(Predicate<Holder<Item>>)` | `is(Ljava/util/function/Predicate;)Z` |
+| `ItemInstance → TypedInstance<Item>` | `is(T rawType)` 泛型默认方法 | **`is(Ljava/lang/Object;)Z`** |
+
+原版 `ZombieVillager.mobInteract` 里的 `itemStack.is(Items.GOLDEN_APPLE)` 走的是**第二个**——
+常量池里核实过是 `Methodref ItemStack.is:(Ljava/lang/Object;)Z`。
+**`javap ItemStack` 只会列出它自己声明的那个，继承来的看不见**，
+所以光看 javap 会以为只有一个 `is`，然后 Mixin 的 target 写错。
+
+`TypedInstance<T>` 一共 5 个重载：`is(TagKey)` / `is(HolderSet)` / `is(T)` / `is(Holder<T>)` / `is(ResourceKey<T>)`。
+
+#### MixinExtras 可以直接用，不用加依赖
+
+- 编译类路径上就有 `io.github.llamalad7:mixinextras-fabric:0.5.5`
+  （`./gradlew dependencies --configuration compileClasspath` 能看到）
+- 运行期由 Fabric Loader 自带，日志里会打
+  `Initializing MixinExtras via ...MixinExtrasServiceImpl(version=0.5.5)`
+- 注解包名 `com.llamalad7.mixinextras.injector.ModifyExpressionValue`
+
+**改「某个表达式的返回值」优先用它而不是 `@Redirect`**：它只改这一句，
+可以只把 false 改成 true、不会把别人的 true 改回 false，跟别的模组改同一句时不会互相顶掉
+（`@Redirect` 是独占的，同一个注入点只允许一个）。
+
+```java
+@ModifyExpressionValue(method = "mobInteract",
+        at = @At(value = "INVOKE",
+                 target = "Lnet/minecraft/world/item/ItemStack;is(Ljava/lang/Object;)Z"))
+private boolean handler(boolean original, Player player, InteractionHand hand) { ... }
+```
+
+#### 怎么确认「Mixin 真的注入了」——不是「没报错」
+
+启动时加 `-Dmixin.debug.export=true`，Mixin 会把**改写后**的 class 导到
+`run/.mixin.out/class/...`，直接 javap 看：
+
+```bash
+JAVA_TOOL_OPTIONS="-Dmixin.debug.export=true" ./gradlew runClient
+JAVAP="/c/Program Files/Java/jdk-25/bin/javap"
+"$JAVAP" -c -p run/.mixin.out/class/net/minecraft/world/entity/monster/zombie/ZombieVillager.class
+```
+
+看到自己的 handler（本项目是
+`modifyExpressionValue$zgc000$mylovelymilkdragon$mdragon$milkDragonMilkCures`）
+被插在原位置才算数。
+
+⚠️ **`latest.log` 里没报错 ≠ 注入成功**：目标类可能是惰性加载的，
+那次启动压根没碰过它。2026-10-02 实测 `ZombieVillager` 在启动阶段就会被加载
+（导出了改写后的 class），但这不是所有类都成立。
+
+#### `shouldApplyEffectTickThisTick` 的参数是**剩余时长**；`applyEffectTick` 返回 false 会摘掉效果
+
+```java
+// MobEffectInstance.tickServer
+int tickCount = this.isInfiniteDuration() ? target.tickCount : this.duration;   // ← 剩余时长
+if (this.effect.value().shouldApplyEffectTickThisTick(tickCount, this.amplifier)
+        && !this.effect.value().applyEffectTick(serverLevel, target, this.amplifier)) {
+    return false;    // ← applyEffectTick 返回 false = 效果被移除
+}
+```
+
+- 「每 5 秒一次」写成 `return tickCount % 100 == 0;`（从末尾往前数，效果仍是等间隔）
+- `applyEffectTick` **必须 return true**，否则等于自己把效果删了
+- `MobEffect` 的默认 `shouldApplyEffectTickThisTick` 返回 `false` ——
+  **不覆写就永远不 tick**，这正是 5.4 说的「空壳效果什么都不会发生」
+
+#### `Level.playSound(Entity except, ...)` 的第一个参数是「**除了**谁」
+
+想在服务端**只放给某一个人**听，不能用它——把目标传进去恰好相反（全场只有他听不见）。
+原版是直接发封包（`Raid` / `PlaySoundCommand` 都这么写）：
+
+```java
+player.connection.send(new ClientboundSoundPacket(
+        BuiltInRegistries.SOUND_EVENT.wrapAsHolder(soundEvent),   // SoundEvent → Holder<SoundEvent>
+        SoundSource.AMBIENT, x, y, z, volume, pitch, seed));
+// 构造：(Holder<SoundEvent>, SoundSource, double x, double y, double z, float, float, long)
+```
+
+⚠️ `SoundEvents` 里各常量的**声明类型并不一致**：`AMBIENT_CAVE` 是
+`Holder.Reference<SoundEvent>`，`CREEPER_PRIMED` 是 `SoundEvent`，
+`TRIDENT_THUNDER` 是 `Holder<SoundEvent>`。混着用就先统一成 `SoundEvent`
+（Holder 的取 `.value()`），发封包时再 `wrapAsHolder` 转回去。
+
+#### `MobEffectCategory` 只影响 HUD 排序和提示文字颜色
+
+全代码库只有两处读它：`Hud`（`isBeneficial()` 决定图标谁排前面）和
+`PotionContents`（`getTooltipFormatting()` 决定那行字的颜色）。**没有任何功能后果。**
+
+#### 让「生气」的生物真正消气，光改状态位是不够的
+
+`HurtByTargetGoal` 盯的是 `getTarget()`，跟自定义的愤怒标志位**没有任何关系**。
+只把自己的 `isAngry` 置回 false，会出现「贴图换回来了、移速也降了，但还在追着你打」
+的怪状态。要么认了，要么真消气时一并清：
+
+```java
+this.setTarget(null);
+this.setLastHurtByMob(null);      // public
+this.getNavigation().stop();
+```
+
+#### 喂东西给生物：用 `Mob.usePlayerItem`，别用 `stack.consume(1, player)`
+
+```java
+protected void usePlayerItem(Player player, InteractionHand hand, ItemStack itemStack)
+// 内部会读 USE_REMAINDER 组件（= Item.Properties.usingConvertsTo(...) 登记的东西），
+// 把「喝完留下的空桶」这类剩余物塞回玩家手里
+```
+
+直接 `consume` 就只是少一个，空桶没了。
+
 ## 6. 资源文件路径（已验证）
 
 ```
@@ -1410,6 +1555,19 @@ src/main/resources/
   见 5.30）。实机验证：用户建创造世界、摆酿造台，
   **成功酿出奶龙药水**；日志全程无配方解析报错
   （19:23:49 集成服务端启动 → 19:33:24 正常退出，`Failed to parse` 出现 0 次）
+- **奶龙的奶四条饮用效果全部落地**（2026-10-02，阶段 6b，见 5.31）：
+  - 新增 `ModEffects`（注册类）+ `effect/HallucinationEffect`（幻听）
+  - `+5 护甲` 走 `MobEffect.addAttributeModifier(...ADD_VALUE)`，
+    `幻听` 每 5 秒发 `ClientboundSoundPacket` **只给喝的人**听
+  - 饮用效果从 `Consumables.MILK_BUCKET` 换成自定义的 `milkConsumable()`：
+    **先清空、后挂效果**（顺序反了会被自己清掉，见 5.31）
+  - `MilkDragonEntity.mobInteract`：喂奶龙的奶消怒
+  - `ZombieVillagerMixin`：用 MixinExtras 的 `@ModifyExpressionValue`
+    把金苹果判定放宽成「金苹果 **或** 奶龙的奶」，原版治愈流程一行没改
+  - 启动验证：`[奶龙] 模组加载完成` 无异常，且用
+    `-Dmixin.debug.export=true` 导出改写后的 `ZombieVillager.class`，
+    javap 确认 handler 已插在 `ItemStack.is(Object)` 那一条上（判断注入是否
+    成功的方法见 5.31）
 
 ### 还没做的（重要）
 
@@ -1442,7 +1600,9 @@ src/main/resources/
 - [ ] **无合成配方**（`recipe/` 下目前**只有酿造的 3 条**）、无 `sounds.json`
 - [ ] `ExampleMixin` 是模板遗留物，注入 `MinecraftServer.loadLevel`，目前没用
 - [ ] 药水内部效果仍叫「龙息」，**命名待定**（见 11.7），不阻塞开发
-- [ ] 奶龙的奶还差 11.3 里的两条效果（+5 护甲、幻听）和 Mixin 治愈僵尸村民，属阶段 6b
+- [ ] 幻听的音效池（8 个原版音效）、间隔（5 秒）、两个效果的时长（护甲 3 分钟 / 幻听 1 分钟）
+      都是**占位值**，原设计没写数，都在 `HallucinationEffect` 和 `ModItems.milkConsumable()`
+      顶部改。幻听用的是原版音效占位，等自定义音效到位后按第 9 节的流程换
 - [ ] `README.md` 还是模板内容
 
 ## 11. 功能设计（定稿）
@@ -1673,7 +1833,7 @@ src/main/resources/
 | **4** | 掉落 + 奶龙头（可佩戴物品）：战利品表、头物品、`convertTo` 同化村民 | ✅ 已完成 |
 | **5** | 自然生成：村庄高概率 + 野外低概率，均无视光照 | ✅ 已完成（2026-10-02，见 5.27） |
 | **6a** | 奶龙药水 + 酿造配方 | ✅ 已完成（2026-10-02，纯数据包 JSON，零 Java 改动，见 5.30） |
-| **6b** | 奶龙的奶的饮用效果：+5 护甲、幻听、喂奶龙消怒、Mixin 治愈僵尸村民 | ⬜ |
+| **6b** | 奶龙的奶的饮用效果：+5 护甲、幻听、喂奶龙消怒、Mixin 治愈僵尸村民 | ✅ 已完成（2026-10-02，见 5.31） |
 | **7** | 预留：召唤事件 + 奶龙祭坛 | ⬜ |
 
 每阶段收尾都要跑 `./gradlew compileJava` 确认 `BUILD SUCCESSFUL`。
